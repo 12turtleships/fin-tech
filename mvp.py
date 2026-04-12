@@ -1,5 +1,6 @@
 import os
 import json
+import tempfile
 import requests
 import pandas as pd
 import time
@@ -37,6 +38,15 @@ from screen_capture import (
 # Load environment variables
 load_dotenv()
 
+# Total initial capital (USD) for backtests, buy-and-hold benchmark, and trade replay (all cash at t0).
+_raw_ic = os.getenv("INITIAL_CAPITAL_USD", "1000")
+try:
+    INITIAL_CAPITAL_USD = float(_raw_ic) if _raw_ic is not None and str(_raw_ic).strip() != "" else 1000.0
+except ValueError:
+    INITIAL_CAPITAL_USD = 1000.0
+if INITIAL_CAPITAL_USD <= 0:
+    INITIAL_CAPITAL_USD = 1000.0
+
 class DogecoinAnalyzer:
     def __init__(self):
         """Initialize the Dogecoin analyzer with API credentials."""
@@ -65,6 +75,7 @@ class DogecoinAnalyzer:
         # Initialize latest analysis JSON storage
         self.latest_analysis_json = None
         self.latest_chart_image_path = None
+        self._latest_chart_data = None
         
         # Initialize database
         try:
@@ -306,18 +317,15 @@ class DogecoinAnalyzer:
                         usd_balance = current_usd_balance
                         doge_balance = current_doge_balance
                     else:
-                        # Calculate from initial balances by replaying trades
-                        # Start with initial balances: $500 USD + $500 worth of DOGE
-                        initial_usd_value = 500.0
+                        # Calculate from initial balances by replaying trades ($1000 USD cash at t0, 0 DOGE)
                         initial_price_data = self.fetch_historical_price_at_timestamp(
                             datetime.now() - timedelta(days=7)  # Use first simulation time as reference
                         )
                         if initial_price_data:
-                            initial_price = initial_price_data['close']
-                            usd_balance = initial_usd_value
-                            doge_balance = (500.0 / initial_price) if initial_price > 0 else 0.0
+                            usd_balance = float(INITIAL_CAPITAL_USD)
+                            doge_balance = 0.0
                         else:
-                            usd_balance = 500.0
+                            usd_balance = float(INITIAL_CAPITAL_USD)
                             doge_balance = 0.0
                         
                         # Replay trades up to target_date
@@ -860,6 +868,17 @@ class DogecoinAnalyzer:
                     technical_indicators['atr'] = atr.average_true_range().iloc[-1]
                 except:
                     pass
+
+            # ADX — Average Directional Index (trend strength; > 35 = strong trend)
+            if len(df_clean) >= 14:
+                try:
+                    from ta.trend import ADXIndicator
+                    adx_ind = ADXIndicator(high=df_clean['High'], low=df_clean['Low'], close=df_clean['Close'])
+                    technical_indicators['adx'] = adx_ind.adx().iloc[-1]
+                    technical_indicators['adx_pos'] = adx_ind.adx_pos().iloc[-1]
+                    technical_indicators['adx_neg'] = adx_ind.adx_neg().iloc[-1]
+                except Exception:
+                    pass
             
             # VOLUME INDICATORS
             print("📊 Calculating volume indicators...")
@@ -923,6 +942,40 @@ class DogecoinAnalyzer:
             volatility_24h = df_24h['returns'].std() * 100
             volume_24h_avg = df_24h['volume'].mean()
             price_range_24h = ((df_24h['high'].max() - df_24h['low'].min()) / df_24h['close'].iloc[0]) * 100
+
+        # ~6h "edge band" from hourly bars (aligns with cron cadence; not a prediction, descriptive only)
+        short_horizon_stats = {
+            'last_6h_close_return_pct': None,
+            'avg_abs_6h_return_pct_24h': None,
+            'max_up_6h_pct_24h': None,
+            'max_down_6h_pct_24h': None,
+            'samples_6h_windows': 0,
+        }
+        if df_24h is not None and not df_24h.empty and len(df_24h) >= 7:
+            try:
+                closes = df_24h['close'].astype(float)
+                short_horizon_stats['last_6h_close_return_pct'] = round(
+                    (closes.iloc[-1] / closes.iloc[-7] - 1.0) * 100.0, 4
+                )
+                abs_rets = []
+                ups = []
+                downs = []
+                for i in range(6, len(closes)):
+                    seg = (closes.iloc[i] / closes.iloc[i - 6] - 1.0) * 100.0
+                    abs_rets.append(abs(seg))
+                    if seg >= 0:
+                        ups.append(seg)
+                    else:
+                        downs.append(seg)
+                if abs_rets:
+                    short_horizon_stats['avg_abs_6h_return_pct_24h'] = round(
+                        sum(abs_rets) / len(abs_rets), 4
+                    )
+                    short_horizon_stats['max_up_6h_pct_24h'] = round(max(ups), 4) if ups else None
+                    short_horizon_stats['max_down_6h_pct_24h'] = round(min(downs), 4) if downs else None
+                    short_horizon_stats['samples_6h_windows'] = len(abs_rets)
+            except Exception:
+                pass
         
         # Prepare order book metrics
         order_book_metrics = {}
@@ -945,7 +998,25 @@ class DogecoinAnalyzer:
         
         # Calculate technical indicators for 24-hour data
         technical_indicators_24h = self.calculate_technical_indicators(df_24h) if df_24h is not None else {}
-        
+
+        # --- Bargain-hunter derived metrics ---
+        bb_upper = technical_indicators_30d.get('bb_upper')
+        bb_lower = technical_indicators_30d.get('bb_lower')
+        bb_middle = technical_indicators_30d.get('bb_middle')
+
+        # Distance to 30-day support (recent low): how structurally cheap the entry is
+        dist_to_support_pct = round(((current_price - recent_low) / recent_low) * 100, 2) if recent_low and recent_low > 0 else None
+
+        # Bollinger Band Width % — regime filter (narrow = low-vol chop, wide = opportunity)
+        bb_width_pct = None
+        if bb_upper is not None and bb_lower is not None and bb_middle is not None and bb_middle > 0:
+            bb_width_pct = round(((bb_upper - bb_lower) / bb_middle) * 100, 4)
+
+        # Fee-edge %: |price − bb_middle| / bb_middle (must exceed ~2.5% to clear round-trip fees)
+        fee_edge_pct = None
+        if bb_middle is not None and bb_middle > 0:
+            fee_edge_pct = round(abs(current_price - bb_middle) / bb_middle * 100, 4)
+
         comprehensive_data = {
             # 30-day chart data
             'current_price': round(current_price, 6),
@@ -973,6 +1044,7 @@ class DogecoinAnalyzer:
             # 24-hour data
             'volatility_24h': round(volatility_24h, 2),
             'price_range_24h': round(price_range_24h, 2),
+            'short_horizon_stats': short_horizon_stats,
             
             # Order book data
             'order_book': order_book_metrics,
@@ -991,7 +1063,12 @@ class DogecoinAnalyzer:
             
             # News Analysis
             'news_data': news_data,
-            'news_sentiment': news_sentiment
+            'news_sentiment': news_sentiment,
+
+            # Bargain-hunter metrics
+            'dist_to_support_pct': dist_to_support_pct,
+            'bb_width_pct': bb_width_pct,
+            'fee_edge_pct': fee_edge_pct,
         }
         
         return comprehensive_data
@@ -1056,49 +1133,41 @@ class DogecoinAnalyzer:
             # Wait for any animations to settle
             time.sleep(2)
             
-            # Save screenshot to screenshots directory (same as screen_capture.py)
-            screenshots_dir = Path(__file__).resolve().parent / "screenshots"
-            screenshots_dir.mkdir(parents=True, exist_ok=True)
-            
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            screenshot_path = screenshots_dir / f"doge-chart-{timestamp}.png"
-            
+            # Use a temporary file (deleted after reading) to avoid saving images to disk
+            screenshot_path = None
             try:
+                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                    screenshot_path = tmp.name
                 # Capture screenshot with timeout protection
                 try:
-                    driver.save_screenshot(str(screenshot_path))
-                    print(f"✅ Screenshot captured: {screenshot_path}")
+                    driver.save_screenshot(screenshot_path)
+                    print("✅ Screenshot captured (in-memory use only)")
                 except Exception as e:
                     print(f"⚠️  Screenshot capture failed: {e}")
-                    # Try one more time after a short wait
                     time.sleep(1)
                     try:
-                        driver.save_screenshot(str(screenshot_path))
-                        print(f"✅ Screenshot captured on retry: {screenshot_path}")
+                        driver.save_screenshot(screenshot_path)
+                        print("✅ Screenshot captured on retry")
                     except Exception:
                         raise
-                
                 # Read image and convert to base64
                 with open(screenshot_path, 'rb') as img_file:
                     img_bytes = img_file.read()
                     img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-                
-                # Store chart path for database storage
-                self.latest_chart_image_path = str(screenshot_path)
-                
-                print(f"📸 Screenshot saved at: {screenshot_path}")
-                print(f"📊 Image size: {len(img_bytes)} bytes ({len(img_bytes)/1024:.1f} KB)")
-                
+                # Do not store chart path; image not saved to disk
+                self.latest_chart_image_path = None
+                print(f"📊 Image size: {len(img_bytes)} bytes ({len(img_bytes)/1024:.1f} KB) — not saved to disk")
                 return img_base64
             except Exception as e:
                 print(f"⚠️  Error processing screenshot: {e}")
-                # Clean up if file was created but corrupted
+                return None
+            finally:
+                # Always delete the temp file to save disk space
                 if screenshot_path and os.path.exists(screenshot_path):
                     try:
                         os.unlink(screenshot_path)
                     except Exception:
                         pass
-                return None
             
         except Exception as e:
             print(f"⚠️  Error capturing chart screenshot: {e}")
@@ -1110,6 +1179,266 @@ class DogecoinAnalyzer:
                 except Exception:
                     pass
     
+    def _format_trade_learning_context(self, limit=30):
+        """
+        Summarize recent trades from the database for the AI prompt so recommendations
+        can learn from what worked or failed (success flag, reflections, quality labels).
+        """
+        if not self.database_enabled or not self.db:
+            return """
+        **YOUR RECENT TRADES (database):** (not available — database disabled)
+"""
+        try:
+            rows = self.db.get_recent_trades(limit=limit)
+        except Exception as e:
+            return f"""
+        **YOUR RECENT TRADES (database):** (could not load: {e})
+"""
+        if not rows:
+            return """
+        **YOUR RECENT TRADES (database):** No recorded trades yet.
+"""
+        success_ct = fail_ct = 0
+        good_ct = bad_ct = unlabeled_ct = 0
+        for row in rows:
+            if row["success"]:
+                success_ct += 1
+            else:
+                fail_ct += 1
+            dc = row["decision_correct"]
+            if dc == 1:
+                good_ct += 1
+            elif dc == 0:
+                bad_ct += 1
+            else:
+                unlabeled_ct += 1
+        lines = [
+            f"Summary of last {len(rows)} trades (newest first): "
+            f"order executed OK={success_ct}, failed/skipped={fail_ct}; "
+            f"reflections marked correct={good_ct}, incorrect={bad_ct}, not yet labeled={unlabeled_ct}.",
+            "Each line: time, action, %, price at trade, execution, optional outcome label, optional reflection snippet.",
+        ]
+        max_lines = min(25, len(rows))
+        for row in rows[:max_lines]:
+            ts = (row["timestamp"] or "")[:19].replace("T", " ")
+            act = row["action"] or "?"
+            pct = row["percentage"]
+            pct_s = f"{pct:.0f}%" if pct is not None else "?"
+            px = row["current_price"]
+            px_s = f"${px:.4f}" if px is not None else "?"
+            ok = "ok" if row["success"] else "fail"
+            dc = row["decision_correct"]
+            if dc == 1:
+                out = "reflection:good"
+            elif dc == 0:
+                out = "reflection:poor"
+            else:
+                out = "reflection:—"
+            ql = (row["decision_quality_label"] or "").strip()
+            ql_s = f" quality={ql}" if ql else ""
+            ref = (row["reflection"] or "").replace("\n", " ").replace('"', "'").strip()
+            if len(ref) > 160:
+                ref = ref[:160] + "…"
+            ref_s = f' | "{ref}"' if ref else ""
+            lines.append(f"  • {ts} {act} {pct_s} @ {px_s} exec={ok} {out}{ql_s}{ref_s}")
+        buy_streak = 0
+        for row in rows:
+            if (row["action"] or "").upper() == "BUY":
+                buy_streak += 1
+            else:
+                break
+        if buy_streak >= 3:
+            lines.append(
+                f"  • **Cadence note:** The **{buy_streak} newest** rows above are consecutive **BUY** — "
+                "if USD is already a tiny slice of the portfolio, that pattern usually **burns dry powder**; "
+                "weigh **SELL/HOLD** to rebuild USD for the next dip unless the chart is a rare, high-conviction add."
+            )
+        body = "\n        ".join(lines)
+        return f"""
+        **YOUR RECENT TRADES (learn from real outcomes — not theory):**
+        {body}
+"""
+
+    # ─── CIRCUIT BREAKERS & INDUSTRIAL GOVERNANCE ───────────────────────
+    # Non-negotiable hard stops that override any LLM recommendation.
+
+    # Tunables (class-level constants; override via env if desired)
+    CB_DAILY_DRAWDOWN_PCT = float(os.getenv("CB_DAILY_DRAWDOWN_PCT", "4.0"))   # max 24h portfolio drop before sleep
+    CB_SLEEP_HOURS        = float(os.getenv("CB_SLEEP_HOURS", "48"))            # how long to sleep after drawdown trip
+    CB_INVENTORY_MAX_PCT  = float(os.getenv("CB_INVENTORY_MAX_PCT", "50"))      # max % of portfolio in DOGE
+    CB_EXTREME_VOL_PCT    = float(os.getenv("CB_EXTREME_VOL_PCT", "15.0"))      # 24h vol above this → no trade
+    CB_ADX_TREND_THRESH   = float(os.getenv("CB_ADX_TREND_THRESH", "35.0"))     # ADX above this = strong trend
+    CB_ATR_RISK_PCT       = float(os.getenv("CB_ATR_RISK_PCT", "2.0"))          # % of capital at risk per trade for ATR sizing
+    CB_STALE_DATA_MIN     = float(os.getenv("CB_STALE_DATA_MIN", "10.0"))       # minutes of price staleness before refusing
+
+    def _check_circuit_breakers(self, chart_data) -> list:
+        """
+        Run all circuit-breaker checks BEFORE asking the LLM.
+        Returns a list of (tag, message) for every tripped breaker.
+        An empty list means "all clear — proceed to LLM."
+        """
+        tripped = []
+        inv = chart_data.get("investment_status") or {}
+        alloc = inv.get("current_allocation") or {}
+        ti = chart_data.get("technical_indicators_30d") or {}
+
+        # 1. Daily Drawdown Cap
+        #    Uses 24h price range as a proxy; a proper version would compare portfolio value to 24h-ago snapshot.
+        price_range_24h = chart_data.get("price_range_24h", 0) or 0
+        if price_range_24h > self.CB_DAILY_DRAWDOWN_PCT * 2:
+            # crude: if the intra-day range exceeds 2× the drawdown cap, market is too wild
+            pass  # handled more precisely below via portfolio snapshot
+
+        # Check portfolio-level drawdown (compare current value to DB snapshot ~24h ago)
+        try:
+            if self.database_enabled and self.db:
+                from datetime import timedelta as _td
+                recent = self.db.get_all_trades(days=1)
+                if recent:
+                    first_row = recent[0]
+                    old_usd = (first_row["balance_usd_after"] or 0)
+                    old_doge = (first_row["balance_doge_after"] or 0)
+                    old_price = (first_row["current_price"] or 0)
+                    if old_price > 0:
+                        old_value = old_usd + old_doge * old_price
+                        cur_price = chart_data.get("current_price", 0) or 0
+                        cur_bal = inv.get("current_balances") or {}
+                        cur_value = (cur_bal.get("usd") or 0) + (cur_bal.get("doge_value_usd") or 0)
+                        if old_value > 0 and cur_value > 0:
+                            dd_pct = ((old_value - cur_value) / old_value) * 100
+                            if dd_pct >= self.CB_DAILY_DRAWDOWN_PCT:
+                                tripped.append(("DRAWDOWN",
+                                    f"24h portfolio drawdown ~{dd_pct:.1f}% exceeds {self.CB_DAILY_DRAWDOWN_PCT}% cap. "
+                                    f"Force HOLD / SELL only for {self.CB_SLEEP_HOURS}h."))
+        except Exception:
+            pass
+
+        # 2. Inventory Hard-Cap (max DOGE % of portfolio)
+        doge_pct = alloc.get("doge_percentage")
+        if doge_pct is not None:
+            try:
+                if float(doge_pct) > self.CB_INVENTORY_MAX_PCT:
+                    tripped.append(("INVENTORY",
+                        f"DOGE is {float(doge_pct):.1f}% of portfolio (cap {self.CB_INVENTORY_MAX_PCT}%). "
+                        f"BUY is blocked; SELL or HOLD only."))
+            except (TypeError, ValueError):
+                pass
+
+        # 3. Extreme Volatility No-Trade Zone
+        vol_24h = chart_data.get("volatility_24h", 0) or 0
+        if vol_24h > self.CB_EXTREME_VOL_PCT:
+            tripped.append(("EXTREME_VOL",
+                f"24h volatility {vol_24h:.2f}% exceeds {self.CB_EXTREME_VOL_PCT}% threshold. "
+                f"Indicators unreliable — force HOLD."))
+
+        # 4. ADX Regime Filter (strong downtrend = no BUY)
+        adx_val = ti.get("adx")
+        adx_neg = ti.get("adx_neg")
+        adx_pos = ti.get("adx_pos")
+        if adx_val is not None and adx_neg is not None and adx_pos is not None:
+            try:
+                if float(adx_val) > self.CB_ADX_TREND_THRESH and float(adx_neg) > float(adx_pos):
+                    tripped.append(("ADX_DOWNTREND",
+                        f"ADX={float(adx_val):.1f} (>{self.CB_ADX_TREND_THRESH}) with -DI > +DI → strong downtrend. "
+                        f"BUY blocked (catching a falling knife)."))
+            except (TypeError, ValueError):
+                pass
+
+        return tripped
+
+    def _atr_capped_percentage(self, chart_data, llm_pct: float) -> float:
+        """
+        Volatility-weighted position sizing: shrink the LLM's suggested trade %
+        so that dollar-at-risk stays constant (~CB_ATR_RISK_PCT of portfolio).
+        Returns clamped percentage (never exceeds llm_pct, never below 5%).
+        """
+        ti = chart_data.get("technical_indicators_30d") or {}
+        atr_val = ti.get("atr")
+        price = chart_data.get("current_price")
+        if atr_val is None or price is None or price <= 0 or atr_val <= 0:
+            return llm_pct
+        try:
+            atr_pct = (float(atr_val) / float(price)) * 100  # ATR as % of price
+            if atr_pct <= 0:
+                return llm_pct
+            # risk_pct of capital / atr_pct = max fraction of portfolio to risk
+            max_pct = (self.CB_ATR_RISK_PCT / atr_pct) * 100
+            capped = min(llm_pct, max(5.0, max_pct))
+            return round(capped, 1)
+        except Exception:
+            return llm_pct
+
+    def _consecutive_buy_streak(self) -> int:
+        """Count newest consecutive successful BUY trades (0 if latest is SELL/HOLD or failed)."""
+        if not self.database_enabled or not self.db:
+            return 0
+        try:
+            rows = self.db.get_recent_trades(limit=20)
+        except Exception:
+            return 0
+        streak = 0
+        for row in rows:
+            if row["success"] and (row["action"] or "").upper() == "BUY":
+                streak += 1
+            else:
+                break
+        return streak
+
+    def _format_prior_cycle_learning(self, current_price: Optional[float]) -> str:
+        """Compare latest saved analysis/market snapshot to now — realized ~since-last-run drift for calibration."""
+        if not self.database_enabled or not self.db or current_price is None:
+            return ""
+        try:
+            rows = self.db.get_recent_analyses(1)
+        except Exception as e:
+            return f"""
+        **LAST CYCLE vs NOW (DB):** Could not load prior analysis ({e}).
+"""
+        if not rows:
+            return ""
+        prev = rows[0]
+        rec = (prev["recommendation"] or "?").upper()
+        pct = prev["percentage"]
+        pct_s = f"{pct:.0f}%" if pct is not None else "?"
+        ts = (prev["timestamp"] or "")[:19].replace("T", " ")
+        md_id = prev["market_data_id"]
+        if not md_id:
+            return f"""
+        **LAST CYCLE (bot memory):** At {ts} prior recommendation was **{rec}** ({pct_s}); no linked market snapshot for price drift.
+"""
+        md = self.db.get_market_data_by_id(md_id)
+        if not md or md["current_price"] is None:
+            return ""
+        try:
+            p0 = float(md["current_price"])
+            p1 = float(current_price)
+        except (TypeError, ValueError):
+            return ""
+        if p0 <= 0:
+            return ""
+        move_pct = (p1 - p0) / p0 * 100.0
+        hrs_note = ""
+        try:
+            raw_ts = (prev["timestamp"] or "").replace("Z", "")
+            prev_dt = datetime.fromisoformat(raw_ts[:19])
+            hrs = (datetime.now() - prev_dt).total_seconds() / 3600.0
+            hrs_note = f" (~{hrs:.1f} h since prior snapshot)"
+        except Exception:
+            hrs_note = ""
+        if move_pct > 0.15:
+            hint = "Spot rose over that span — a prior SELL would have forgone that lift; context for mean-reversion vs trend-follow."
+        elif move_pct < -0.15:
+            hint = "Spot fell over that span — a prior BUY added mark-to-market drag; raising cash earlier could have improved flexibility for this dip."
+        else:
+            hint = "Spot was roughly flat — low edge from churning in that window."
+        return f"""
+        **LAST CYCLE vs NOW (learn what actually happened between runs):**
+        - Prior snapshot price: **${p0:.6f}** at **{ts}** → now **${p1:.6f}** → **{move_pct:+.3f}%** in DOGE{hrs_note}.
+        - Prior logged recommendation: **{rec}** ({pct_s}).
+        - **Read:** {hint}
+        - Use this **only as calibration** for the **next ~6h** decision: if you are about to repeat the same stance while last cycle’s **realized drift** hurt that stance, require **clearer** chart evidence this time.
+"""
+
     def analyze_with_chatgpt(self, chart_data, skip_chart_capture=False):
         """Send chart data to ChatGPT for analysis and get investment recommendation.
         
@@ -1134,197 +1463,139 @@ class DogecoinAnalyzer:
         else:
             print("⏭️  Skipping chart capture for simulation")
         
+        trade_learning_block = self._format_trade_learning_context(limit=30)
+        buy_streak = self._consecutive_buy_streak()
+
+        dry_powder_block = ""
+        inv = chart_data.get("investment_status") or {}
+        if inv:
+            alloc = inv.get("current_allocation") or {}
+            bal = inv.get("current_balances") or {}
+            usd_pct = alloc.get("usd_percentage")
+            usd_cash = bal.get("usd")
+            try:
+                usd_pct_f = float(usd_pct) if usd_pct is not None else None
+                usd_cash_f = float(usd_cash) if usd_cash is not None else None
+            except (TypeError, ValueError):
+                usd_pct_f = usd_cash_f = None
+            if usd_pct_f is not None and usd_pct_f < 15:
+                cash_s = f"${usd_cash_f:.2f}" if usd_cash_f is not None else "low"
+                dry_powder_block = f"""
+        **DRY POWDER WARNING:**
+        - USD is only **~{usd_pct_f:.1f}%** of portfolio (**{cash_s}** cash). Repeated BUYs shrink to tiny notional.
+        - When dry powder is this tight: **SELL** to raise USD or **HOLD** — do not BUY by habit.
+"""
+
+        prior_cycle_block = self._format_prior_cycle_learning(chart_data.get("current_price"))
+        sh = chart_data.get("short_horizon_stats") or {}
+
+        def _fmt_pct(v, signed=False):
+            if v is None or (isinstance(v, float) and v != v):
+                return "n/a"
+            return f"{v:+.4f}%" if signed else f"{v:.4f}%"
+
+        nwin = int(sh.get("samples_6h_windows") or 0)
+        if nwin <= 0:
+            short_horizon_block = """
+        **NEXT ~6H OPPORTUNITY BAND:** Hourly history too short for 6h-window stats this run.
+"""
+        else:
+            short_horizon_block = f"""
+        **NEXT ~6H OPPORTUNITY BAND (descriptive, not a target):**
+        - Last ~6h move: **{_fmt_pct(sh.get('last_6h_close_return_pct'), signed=True)}**
+        - Avg |6h move| (24h): **{_fmt_pct(sh.get('avg_abs_6h_return_pct_24h'))}**
+        - Max up 6h: **{_fmt_pct(sh.get('max_up_6h_pct_24h'), signed=True)}**; max down 6h: **{_fmt_pct(sh.get('max_down_6h_pct_24h'), signed=True)}**
+        - Only trade when expected edge **clears** this noise band + fees; otherwise **HOLD**.
+"""
+        
         # Prepare the prompt for ChatGPT
         chart_image_note = ""
         if chart_image_base64:
-            chart_image_note = "\n\n📈 CHART IMAGE:\nA live chart screenshot of the DOGE-USD trading view is provided below. Please analyze the visual chart patterns, candlestick formations, Bollinger Bands overlay, and other technical indicators visible in the image. Consider the chart patterns alongside the numerical data provided.\n"
-        
+            chart_image_note = "\n\n📈 CHART IMAGE: A live DOGE-USD chart with Bollinger Bands is attached. Analyze visual patterns alongside the data below.\n"
+
+        # Governance: consecutive-buy streak + circuit breaker constraints
+        streak_block = ""
+        if buy_streak >= 3:
+            streak_block += f"""
+        **🚫 CONSECUTIVE-BUY CAP ACTIVE: {buy_streak} successful BUYs in a row without a SELL.**
+        You are FORBIDDEN from recommending BUY. Output HOLD or SELL only.
+"""
+        cb_constraints = chart_data.get("_circuit_breaker_constraints") or []
+        for tag, msg in cb_constraints:
+            if tag == "INVENTORY":
+                streak_block += f"""
+        **🚫 INVENTORY CAP: {msg}**
+        BUY is BLOCKED by the circuit breaker. Output HOLD or SELL only.
+"""
+            elif tag == "ADX_DOWNTREND":
+                streak_block += f"""
+        **🚫 STRONG DOWNTREND: {msg}**
+        BUY is BLOCKED by the circuit breaker. Output HOLD or SELL only.
+"""
+
         prompt = f"""
-        As a professional financial analyst, please analyze the following comprehensive Dogecoin (DOGE) data and provide a personalized investment recommendation.{chart_image_note}
+        Analyze DOGE for the next ~6-hour automated trading cycle. Apply the Bargain Hunter mean-reversion strategy from your system prompt.{chart_image_note}
 
-        📊 MARKET DATA ANALYSIS:
-        
-        **30-Day Chart Data:**
-        - Current Price: ${chart_data['current_price']}
-        - Price 30 days ago: ${chart_data['price_30_days_ago']}
-        - Price Change: ${chart_data['price_change']} ({chart_data['price_change_percent']}%)
-        - Recent High: ${chart_data['recent_high']}
-        - Recent Low: ${chart_data['recent_low']}
-        - 30-Day Volatility: {chart_data['volatility_30d']}%
-        - 7-day Moving Average: ${chart_data['moving_averages']['ma_7']}
-        - 14-day Moving Average: ${chart_data['moving_averages']['ma_14']}
-        - 30-day Moving Average: ${chart_data['moving_averages']['ma_30']}
-        
-        **24-Hour Analysis:**
-        - 24-Hour Volatility: {chart_data['volatility_24h']}%
-        - 24-Hour Price Range: {chart_data['price_range_24h']}%
-        - Average Volume (30d): {chart_data['volume_analysis']['avg_volume_30d']}
-        - Recent Volume (30d): {chart_data['volume_analysis']['recent_volume_30d']}
-        - Average Volume (24h): {chart_data['volume_analysis']['avg_volume_24h']}
-        
-        **Order Book Analysis:**
-        - Best Bid: ${chart_data['order_book'].get('best_bid', 'N/A')}
-        - Best Ask: ${chart_data['order_book'].get('best_ask', 'N/A')}
-        - Spread: ${chart_data['order_book'].get('spread', 'N/A')} ({chart_data['order_book'].get('spread_percent', 'N/A')}%)
-        - Bid Volume (Top 10): {chart_data['order_book'].get('bid_volume_top10', 'N/A')}
-        - Ask Volume (Top 10): {chart_data['order_book'].get('ask_volume_top10', 'N/A')}
-        - Volume Imbalance: {chart_data['order_book'].get('volume_imbalance', 'N/A')}%
-        
-        **CURRENT INVESTMENT STATUS:**
-        - Portfolio Value: ${chart_data['investment_status'].get('portfolio_value', 'N/A')}
-        - Current USD Allocation: {chart_data['investment_status'].get('current_allocation', {}).get('usd_percentage', 'N/A')}%
-        - Current DOGE Allocation: {chart_data['investment_status'].get('current_allocation', {}).get('doge_percentage', 'N/A')}%
-        - Total Trades Executed: {chart_data['investment_status'].get('performance', {}).get('total_trades', 'N/A')}
-        - Success Rate: {chart_data['investment_status'].get('performance', {}).get('success_rate', 'N/A')}%
+        **EXECUTION CADENCE:** Bot runs every ~6 hours (cron). No intraday monitoring between runs.
+{streak_block}
+        📊 MARKET DATA:
 
-        **TECHNICAL ANALYSIS INDICATORS (30-Day):**
-        
-        **Trend Indicators:**
-        - SMA 7: ${chart_data['technical_indicators_30d'].get('sma_7', 'N/A')}
-        - SMA 14: ${chart_data['technical_indicators_30d'].get('sma_14', 'N/A')}
-        - SMA 30: ${chart_data['technical_indicators_30d'].get('sma_30', 'N/A')}
-        - EMA 7: ${chart_data['technical_indicators_30d'].get('ema_7', 'N/A')}
-        - EMA 14: ${chart_data['technical_indicators_30d'].get('ema_14', 'N/A')}
-        - MACD: {chart_data['technical_indicators_30d'].get('macd', 'N/A')}
-        - MACD Signal: {chart_data['technical_indicators_30d'].get('macd_signal', 'N/A')}
-        - ADX: {chart_data['technical_indicators_30d'].get('adx', 'N/A')}
-        
-        **Momentum Indicators:**
+        **Price & Range (30d):**
+        - Current: ${chart_data['current_price']}  |  30d ago: ${chart_data['price_30_days_ago']}  |  Change: {chart_data['price_change_percent']}%
+        - 30d High: ${chart_data['recent_high']}  |  30d Low: ${chart_data['recent_low']}
+        - 30d Volatility: {chart_data['volatility_30d']}%
+        - MA-7: ${chart_data['moving_averages']['ma_7']}  |  MA-14: ${chart_data['moving_averages']['ma_14']}  |  MA-30: ${chart_data['moving_averages']['ma_30']}
+
+        **24h Analysis:**
+        - Volatility: {chart_data['volatility_24h']}%  |  Price Range: {chart_data['price_range_24h']}%
+        - Volume (30d avg): {chart_data['volume_analysis']['avg_volume_30d']}  |  Volume (24h avg): {chart_data['volume_analysis']['avg_volume_24h']}
+{prior_cycle_block}{short_horizon_block}
+        **BOLLINGER BANDS & KEY INDICATORS (30d) — PRIMARY DECISION TOOLS:**
+        - BB Upper: ${chart_data['technical_indicators_30d'].get('bb_upper', 'N/A')}
+        - BB Middle: ${chart_data['technical_indicators_30d'].get('bb_middle', 'N/A')}
+        - BB Lower: ${chart_data['technical_indicators_30d'].get('bb_lower', 'N/A')}
+        - BB %B: {chart_data['technical_indicators_30d'].get('bb_percent', 'N/A')}
+        - **BB Width %: {chart_data.get('bb_width_pct', 'N/A')}%** (narrow < 5% = low-vol chop; wide > 10% = opportunity)
+        - **Fee-edge %: {chart_data.get('fee_edge_pct', 'N/A')}%** (|price − bb_middle| / bb_middle; must be > 2.5% to clear round-trip fees)
         - RSI: {chart_data['technical_indicators_30d'].get('rsi', 'N/A')}
-        - Stochastic %K: {chart_data['technical_indicators_30d'].get('stoch_k', 'N/A')}
-        - Stochastic %D: {chart_data['technical_indicators_30d'].get('stoch_d', 'N/A')}
-        - Williams %R: {chart_data['technical_indicators_30d'].get('williams_r', 'N/A')}
-        - CCI: {chart_data['technical_indicators_30d'].get('cci', 'N/A')}
-        - ROC: {chart_data['technical_indicators_30d'].get('roc', 'N/A')}%
-        
-        **Volatility Indicators:**
-        - Bollinger Upper: ${chart_data['technical_indicators_30d'].get('bb_upper', 'N/A')}
-        - Bollinger Middle: ${chart_data['technical_indicators_30d'].get('bb_middle', 'N/A')}
-        - Bollinger Lower: ${chart_data['technical_indicators_30d'].get('bb_lower', 'N/A')}
-        - Bollinger %B: {chart_data['technical_indicators_30d'].get('bb_percent', 'N/A')}
+        - MACD: {chart_data['technical_indicators_30d'].get('macd', 'N/A')}  |  Signal: {chart_data['technical_indicators_30d'].get('macd_signal', 'N/A')}
         - ATR: {chart_data['technical_indicators_30d'].get('atr', 'N/A')}
-        
-        **Volume Indicators:**
-        - OBV: {chart_data['technical_indicators_30d'].get('obv', 'N/A')}
-        - CMF: {chart_data['technical_indicators_30d'].get('cmf', 'N/A')}
-        - VWAP: ${chart_data['technical_indicators_30d'].get('vwap', 'N/A')}
+        - ADX: {chart_data['technical_indicators_30d'].get('adx', 'N/A')} (+DI: {chart_data['technical_indicators_30d'].get('adx_pos', 'N/A')}, -DI: {chart_data['technical_indicators_30d'].get('adx_neg', 'N/A')})
 
-        **MARKET SENTIMENT (Fear and Greed Index):**
-        - Current Value: {chart_data['fear_greed_index'].get('current', {}).get('value', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'}
-        - Classification: {chart_data['fear_greed_index'].get('current', {}).get('classification', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'}
-        - Time Until Update: {chart_data['fear_greed_index'].get('current', {}).get('time_until_update', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'} seconds
-        - Historical Trend: {len(chart_data['fear_greed_index'].get('historical', [])) if chart_data.get('fear_greed_index') else 0} previous readings available
+        **BARGAIN-HUNTER SIZING METRICS:**
+        - **dist_to_support_pct: {chart_data.get('dist_to_support_pct', 'N/A')}%** (distance from current price to 30d low; < 2% = aggressive size, 2-5% = moderate, > 5% = small/HOLD)
 
-        **RECENT NEWS ANALYSIS:**
-        - Total Articles Analyzed: {chart_data['news_data'].get('total_articles', 'N/A') if chart_data.get('news_data') else 'N/A'}
-        - News Sentiment Analysis: {chart_data['news_sentiment'] if chart_data.get('news_sentiment') else 'N/A'}
-        - Top News Headlines:
-        {chr(10).join([f"  • {article['headline']}" for article in chart_data['news_data'].get('articles', [])[:3]]) if chart_data.get('news_data') and chart_data['news_data'].get('articles') else '  • No news data available'}
+        **CURRENT POSITION:**
+        - Portfolio: ${chart_data['investment_status'].get('portfolio_value', 'N/A')}
+        - USD: ${(chart_data['investment_status'].get('current_balances', {{}}).get('usd') or 0):.2f} ({chart_data['investment_status'].get('current_allocation', {{}}).get('usd_percentage', 'N/A')}%)
+        - DOGE (USD): ${(chart_data['investment_status'].get('current_balances', {{}}).get('doge_value_usd') or 0):.2f} ({chart_data['investment_status'].get('current_allocation', {{}}).get('doge_percentage', 'N/A')}%)
+        - Consecutive successful BUYs (newest): **{buy_streak}** (if >= 3: BUY is FORBIDDEN — see system prompt rule 6)
 
-        Please provide your analysis in the following JSON format:
+        **SENTIMENT:**
+        - Fear & Greed: {chart_data['fear_greed_index'].get('current', {{}}).get('value', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'} ({chart_data['fear_greed_index'].get('current', {{}}).get('classification', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'})
+
+        **Order Book:** Spread: ${chart_data['order_book'].get('spread', 'N/A')} ({chart_data['order_book'].get('spread_percent', 'N/A')}%) | Imbalance: {chart_data['order_book'].get('volume_imbalance', 'N/A')}%
+{trade_learning_block}{dry_powder_block}
+        **OUTPUT JSON (strict format):**
         {{
             "recommendation": "BUY|SELL|HOLD",
-            "percentage": <number between 0-100, null if HOLD>,
+            "percentage": <10-30 or null if HOLD>,
+            "invalidation_price": <price where thesis is wrong, null if HOLD/SELL>,
             "confidence_level": "High|Medium|Low",
-            "reasoning": "<detailed reasoning text>",
+            "reasoning": "<1-3 sentences: which Bargain Hunter rule triggered, fee-edge check, regime, dist_to_support sizing>",
             "risk_assessment": "Low|Medium|High",
-            "risk_factors": ["<factor1>", "<factor2>", ...],
-            "portfolio_rebalancing": "<rebalancing considerations text>",
-            "key_market_factors": ["<factor1>", "<factor2>", ...],
-            "timing_considerations": "<timing considerations text>"
+            "risk_factors": ["<factor1>", "<factor2>"],
+            "key_market_factors": ["<factor1>", "<factor2>"],
+            "timing_considerations": "<next 6h expectation>"
         }}
 
-        For percentage recommendations (following proven risk management principles):
-        - BUY: Suggest 20-30% of available funds when bullish signals are clear (rigorous risk management - never recommend 100% allocation)
-        - SELL: Suggest 20-30% of current holdings when bearish signals are clear or taking profits is prudent (never recommend 100% sell unless extreme circumstances)
-        - HOLD: Set percentage to null (not 0). Only recommend HOLD when:
-          * There are genuinely mixed signals with no clear direction
-          * Waiting for confirmation is truly the best strategy
-          * NOT just because you're being overly cautious - if there's a clear signal (even if modest), make a recommendation
-        - CRITICAL: Balance capital preservation with opportunity. Being too conservative means missing profitable opportunities. 
-        - Make DECISIVE recommendations when signals are present - don't default to HOLD just because you're uncertain
+        **SIZE RULES:**
+        - BUY: 10-30% of USD based on dist_to_support (see system prompt rule 9). Never 100%.
+        - SELL: 20-30% of DOGE when price hits BB Middle or above. Take the snap-back, don't wait for the moon.
+        - HOLD: percentage = null. Default when price is in "No Man's Land" (middle of BB) or fee-edge < 2.5%.
+        - If USD < $20: BUY is infeasible — HOLD or SELL only.
 
-        IMPORTANT DECISION GUIDELINES:
-        - **AGGRESSIVE BUY SIGNALS**: 
-          * Price near historical support level → STRONG BUY signal (buying opportunity at discounted price)
-          * Price dropped significantly (10%+ in 30 days) → BUY opportunity (mean reversion potential)
-          * Fear and Greed Index shows extreme fear (<30) → BUY opportunity (contrarian strategy)
-          * Price below key moving averages BUT near support → BUY (buying at support)
-          * Portfolio is heavily weighted to USD (>70%) → Look for BUY opportunities to rebalance
-        - If price is near support with bullish patterns forming → BUY (don't just HOLD waiting)
-        - If price is near resistance with bearish patterns forming → SELL (don't just HOLD hoping)
-        - If price shows clear trend with momentum → Follow the trend with BUY or SELL
-        - **CRITICAL**: When portfolio is >70% USD and price is near support or has dropped significantly, BUY is the default action (not HOLD)
-        - **CRITICAL**: When Fear and Greed Index shows extreme fear (<30), consider BUY as a contrarian opportunity
-        - HOLD should be a conscious strategic choice, not a default due to uncertainty
-        - **NEVER** recommend HOLD when price is at support AND portfolio is heavily weighted to USD (>70%) - this is a clear BUY opportunity
-
-        In your reasoning, prioritize in this order (CHART ANALYSIS IS PRIMARY):
-
-        PRIMARY ANALYSIS (Most Important):
-        1. **Chart Analysis - Support and Resistance Levels**:
-           - Identify key support and resistance levels from the chart (CRITICAL for buy/sell decisions)
-           - Use support/resistance as benchmarks to determine entry and exit points
-           - These are the most important decision-making tools
-        
-        2. **Chart Analysis - Candlestick Patterns and Moving Averages**:
-           - Focus on candlestick patterns (primary tool for reading market psychology)
-           - Analyze moving averages (more important than technical indicators)
-           - Decipher the underlying psychology of market participants from chart patterns
-           - Predict market trends and reversals through candlestick formations
-        
-        3. **Chart Analysis - Market Flow and Psychology**:
-           - Read market flow from the chart
-           - Understand market participant psychology reflected in the chart
-           - Identify uptrends and downtrends from chart analysis
-           - Observe how market is reacting to key levels
-
-        SECONDARY ANALYSIS (Supporting Factors):
-        4. **Market Sentiment Analysis**:
-           - Use Fear and Greed Index to understand market sentiment
-           - Remember: if market sentiment is positive, even negative news likely has little effect
-           - If sentiment is negative, even positive news likely has little impact
-           - Chart-based sentiment (from visual chart) takes priority over numerical sentiment
-        
-        5. **Trend Analysis** (from chart):
-           - Moving averages visible in the chart
-           - Short-term vs long-term trends visible in the chart
-           - Chart formations and patterns
-
-        TERTIARY ANALYSIS (Reference Only):
-        6. Technical indicators (RSI, MACD, Bollinger Bands, etc.) - use as reference, not primary decision makers
-        7. Volume analysis (OBV, CMF, VWAP, volume bars) - supporting information
-        8. News sentiment - consider but prioritize chart signals over news
-        9. Order book depth - reference information only
-        10. Current portfolio allocation - factor into risk management
-        11. Recent trading performance - context only
-
-        REMEMBER: Chart-based trading is the foundation. Technical indicators are secondary. News is tertiary.
-
-        **PORTFOLIO REBALANCING LOGIC** (CRITICAL - CHECK THIS FIRST):
-        - Current portfolio allocation is shown in "Current Investment Status"
-        - **IF USD allocation >70% AND (price near support OR price dropped 10%+ OR Fear Index <30)**:
-          → **BUY 20-30% to rebalance** (portfolio is too USD-heavy, this is a buying opportunity)
-          → Do NOT recommend HOLD when portfolio is >70% USD - this means money is sitting idle
-        - **IF DOGE allocation >70% AND (price near resistance OR price rose 10%+ OR Greed Index >70)**:
-          → **SELL 20-30% to rebalance** (take profits, reduce exposure)
-        - Balance is key - don't let portfolio become too heavily weighted in one direction
-
-        **FEAR = BUY OPPORTUNITY** (Contrarian Strategy):
-        - When Fear and Greed Index is <30 (extreme fear) → **BUY opportunity** (buy when others are fearful)
-        - Fear often indicates oversold conditions and potential bounce
-        - "Buy the dip" - significant price drops (10%+) are buying opportunities, not reasons to HOLD
-
-        **REBALANCING EXAMPLES**:
-        - Portfolio: 99% USD, 1% DOGE, Price near support, Fear Index: 29
-          → **BUY 25-30%** (rebalance from USD to DOGE at support level)
-        - Portfolio: 50% USD, 50% DOGE, Price near resistance, Greed Index: 75
-          → **SELL 20-25%** (take profits, reduce DOGE exposure)
-        - Portfolio: 80% USD, 20% DOGE, Price dropped 15%, Fear Index: 30
-          → **BUY 25%** (buying opportunity: price dropped, fear present, USD-heavy)
-
-        Consider the investor's current position and provide personalized advice based on their specific portfolio allocation and trading history.
-        Return ONLY valid JSON, no additional text before or after.
+        Return ONLY valid JSON, no text before or after.
         """
         
         try:
@@ -1334,64 +1605,58 @@ class DogecoinAnalyzer:
             messages = [
                 {
                     "role": "system",
-                    "content": """
-                        You are a chart-based Bitcoin trading system that strictly follows the principles and trading philosophy of a professional Bitcoin investor.
-                        Your mission is to execute trades with high win rates, strict risk control, and consistent compounding returns.
-                        Follow these rules precisely:
+                    "content": """You are an AGGRESSIVE DOGE BARGAIN HUNTER. Your edge is MEAN REVERSION with strict governance.
 
-                        1. Core Philosophy
-                        - Trade only based on charts — never on news, rumors, or speculative information.
-                        - Ignore metrics like long/short ratios, liquidation data, or funding rates unless they clearly influence overall market sentiment.
-                        - Your edge is chart mastery — read price action and market psychology through candlestick patterns, support/resistance, and trend structure.
+STRATEGIC MANDATE (follow in order):
 
-                        2. Market Sentiment & Flexibility
-                        - Continuously evaluate market sentiment.
-                        - If sentiment is positive, negative news has limited effect — the market tends to rise.
-                        - If sentiment is negative, positive news has limited effect — the market tends to fall.
-                        - Adapt your trading plan flexibly based on the current sentiment and market behavior.
-                        - Use macro indicators and major economic events only to understand the bigger market context, not for direct trade triggers.
+1. THE BUY EDGE — Only BUY when DOGE is "stretched" to the downside:
+   - Price near or below the Lower Bollinger Band AND RSI < 35 = strong BUY zone.
+   - Fear & Greed Index < 30 (extreme fear) adds conviction — contrarian entry.
+   - The closer price sits to 30-day Support, the more aggressive the size (structurally cheap = tight invalidation).
 
-                        3. Chart-Based Strategy
-                        - Identify major support and resistance levels to determine precise buy/sell zones.
-                        - Analyze overall market structure to detect uptrends, downtrends, and reversals.
-                        - Use candlestick formations and moving averages (not complex indicators) to confirm entry or exit signals.
-                        - Focus primarily on Bitcoin and large-cap coins.
-                        - When trading altcoins, always reference Bitcoin’s chart trend first.
+2. THE SELL EDGE — SELL (take profit) when price snaps back toward the Mean:
+   - Price returns to or exceeds the Bollinger Middle Band (20-day SMA) = take-profit zone.
+   - Price near or above Upper Bollinger Band = aggressive SELL (overbought rubber-band).
+   - Do NOT "wait for the moon" — capture the 3-5% mean-reversion snap-back and exit.
 
-                        4. Risk Management & Stop-Loss
-                        - Apply mechanical stop-losses when:
-                        - The market deviates from your planned scenario, or
-                        - Your mental or emotional state becomes unstable.
-                        - Predefine stop-loss levels before each trade and execute them without hesitation or emotion.
-                        - Never average down losing positions.
-                        - Split positions into smaller trades to reduce risk exposure.
-                        - Preserve capital above all else.
+3. NO MAN'S LAND — When price is in the middle of the Bollinger Bands with no clear stretch:
+   - Default to HOLD. Trading the middle is paying fees for noise.
+   - Exception: if dry powder is nearly gone (USD < 10% of portfolio), a small SELL to rebuild cash is permitted for tactical optionality.
 
-                        5. Leverage & Capital Management
-                        - Use only 20–30% of total available capital per active trade.
-                        - When total capital is small, up to 10x leverage may be used cautiously.
-                        - As total assets grow, gradually reduce leverage to maintain safety and stability.
-                        - Always practice split buying and stop-loss selling.
-                        - Avoid impulsive trades or emotional reactions to price swings.
+4. FEE GATE — Do NOT recommend a trade unless the distance between Current Price and the Bollinger Middle Band is at least 2.5%.
+   If |price - bb_middle| / bb_middle < 0.025, the potential gain does not clear Coinbase round-trip fees + slippage. Force HOLD.
 
-                        6. Compounding & Performance Goal
-                        - Prioritize high win rate and small, consistent gains.
-                        - Target 1–2% daily profit, focusing on steady compounding, not large one-time wins.
-                        - Maintain discipline — no revenge trading, no emotional decisions.
-                        - Over time, consistent compounding creates exponential returns.
+5. CRASH GUARD — If 24h Price Change is worse than -10% (a crash / falling knife):
+   - Reduce any BUY size by at least 50% vs what you would normally suggest.
+   - A crash may keep crashing; preserve capital for a second, cheaper entry next cycle.
 
-                        7. Continuous Improvement
-                        - Treat charts as a reflection of collective market psychology.
-                        - Constantly study and practice chart reading to enhance accuracy.
-                        - Each trading day, review performance, note psychological mistakes, and refine entry/exit logic.
+6. CONSECUTIVE-BUY CAP — The user prompt will tell you the current consecutive-BUY streak.
+   If that streak is >= 3, you MUST output HOLD (or SELL if the chart warrants it). You are FORBIDDEN from recommending another BUY until a SELL clears the streak.
+   This prevents averaging down into a structural collapse.
 
-                        Execution Mode
-                        - Analyze Bitcoin chart and sentiment first.
-                        - Identify key levels and trend direction.
-                        - Wait for high-probability setup before entering.
-                        - Manage trades automatically according to this system — never deviate.
-                        - Always prioritize risk management and preservation of trading capital.
-                    """,
+7. INVALIDATION PRICE — Every BUY recommendation MUST include an "invalidation_price" in the JSON: the price level where the trade thesis is wrong.
+   If you cannot identify a clear invalidation level, do NOT trade — output HOLD.
+
+8. REGIME AWARENESS:
+   - Low volatility (Bollinger Band Width narrow, 24h vol < 1%): prefer HOLD; mean-reversion edges are tiny and fees dominate.
+   - High volatility (wide bands, 24h vol > 3%): this is your playground — be aggressive on clear stretches.
+
+9. SIZE FROM RISK, NOT CONFIDENCE:
+   - Use "dist_to_support_pct" (provided in the data) to gauge how structurally cheap the entry is.
+   - dist_to_support < 2% = aggressive size (25-30%); tight stop means limited downside.
+   - dist_to_support 2-5% = moderate size (15-20%).
+   - dist_to_support > 5% = small size (10-15%) or HOLD.
+
+10. CHART IS PRIMARY — Read price action, candlestick patterns, support/resistance, Bollinger Bands from the chart image.
+    Technical indicators (RSI, MACD, etc.) are secondary confirmation. News is tertiary (DOGE news is mostly noise).
+    Sentiment (Fear & Greed) is a regime filter, not a standalone signal.
+
+INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
+- If the user prompt says "CONSECUTIVE-BUY CAP ACTIVE", "INVENTORY CAP", or "STRONG DOWNTREND", BUY is hard-blocked. Do NOT output BUY.
+- If 24h Volatility exceeds the extreme threshold or a daily drawdown breaker fires, you will not even be called — the system will force HOLD.
+- Your suggested percentage will be automatically clamped by a volatility-weighted (ATR-based) position sizer. Suggest your ideal %, and the system will cap it.
+- ADX data is provided. If ADX > 35 with -DI > +DI, a strong downtrend is in effect — the system blocks BUY. Respect this in your reasoning.
+""",
                 },
                 {
                     "role": "user",
@@ -1428,6 +1693,9 @@ class DogecoinAnalyzer:
                         "minimum": 0,
                         "maximum": 100
                     },
+                    "invalidation_price": {
+                        "type": ["number", "null"]
+                    },
                     "confidence_level": {
                         "type": "string",
                         "enum": ["High", "Medium", "Low"]
@@ -1445,9 +1713,6 @@ class DogecoinAnalyzer:
                             "type": "string"
                         }
                     },
-                    "portfolio_rebalancing": {
-                        "type": "string"
-                    },
                     "key_market_factors": {
                         "type": "array",
                         "items": {
@@ -1460,7 +1725,7 @@ class DogecoinAnalyzer:
                 },
                 "required": ["recommendation", "confidence_level", "reasoning", "risk_assessment"],
                 "strict": True,
-                "additionalProperties": False  # Strict: no extra fields allowed
+                "additionalProperties": True
             }
             
             # Note: OpenAI's response_format currently only supports {"type": "json_object"}
@@ -1592,11 +1857,11 @@ class DogecoinAnalyzer:
         try:
             recommendation = analysis_json.get('recommendation', 'HOLD').upper()
             percentage = analysis_json.get('percentage')
+            invalidation = analysis_json.get('invalidation_price')
             confidence = analysis_json.get('confidence_level', 'Medium')
             reasoning = analysis_json.get('reasoning', 'No reasoning provided')
             risk_assessment = analysis_json.get('risk_assessment', 'Medium')
             risk_factors = analysis_json.get('risk_factors', [])
-            portfolio_rebalancing = analysis_json.get('portfolio_rebalancing', 'No specific rebalancing recommendations')
             key_market_factors = analysis_json.get('key_market_factors', [])
             timing_considerations = analysis_json.get('timing_considerations', 'No specific timing considerations')
             
@@ -1611,10 +1876,13 @@ class DogecoinAnalyzer:
             else:
                 formatted += "\n- **Percentage**: N/A (HOLD recommendation)"
             
+            if invalidation is not None:
+                formatted += f"\n- **Invalidation Price**: ${invalidation}"
+
             formatted += f"""
 - **Confidence Level**: {confidence}
 
-#### 2. Brief Reasoning:
+#### 2. Reasoning (Bargain Hunter):
 
 {reasoning}
 
@@ -1625,19 +1893,14 @@ class DogecoinAnalyzer:
                 for factor in risk_factors:
                     formatted += f"\n  - {factor}"
             
-            formatted += f"""
-
-#### 4. Portfolio Rebalancing Considerations:
-{portfolio_rebalancing}"""
-            
             if key_market_factors:
-                formatted += "\n#### 5. Key Market Factors:"
+                formatted += "\n\n#### 4. Key Market Factors:"
                 for factor in key_market_factors:
                     formatted += f"\n- {factor}"
             
             formatted += f"""
 
-#### 6. Timing Considerations:
+#### 5. Timing Considerations:
 {timing_considerations}
 """
             
@@ -2086,21 +2349,33 @@ class DogecoinAnalyzer:
                 if all_trades and len(all_trades) > 0:
                     # Get the most recent trade (trades are ordered oldest first, so get last)
                     last_trade = all_trades[-1]
-                    balance_usd_before = last_trade.get('balance_usd_after', 1000.0 if action == 'BUY' else 0.0)
-                    balance_doge_before = last_trade.get('balance_doge_after', 
-                                                         0.0 if action == 'BUY' else (1000.0 / current_price if current_price > 0 else 0.0))
+                    balance_usd_before = last_trade.get(
+                        'balance_usd_after', float(INITIAL_CAPITAL_USD) if action == 'BUY' else 0.0
+                    )
+                    balance_doge_before = last_trade.get(
+                        'balance_doge_after',
+                        0.0 if action == 'BUY' else (
+                            (float(INITIAL_CAPITAL_USD) / current_price) if current_price > 0 else 0.0
+                        ),
+                    )
                 else:
                     # Default starting balances
-                    balance_usd_before = 1000.0 if action == 'BUY' else 0.0
-                    balance_doge_before = 0.0 if action == 'BUY' else (1000.0 / current_price if current_price > 0 else 0.0)
+                    balance_usd_before = float(INITIAL_CAPITAL_USD) if action == 'BUY' else 0.0
+                    balance_doge_before = (
+                        0.0 if action == 'BUY' else (float(INITIAL_CAPITAL_USD) / current_price if current_price > 0 else 0.0)
+                    )
             else:
                 # Default starting balances
-                balance_usd_before = 1000.0 if action == 'BUY' else 0.0
-                balance_doge_before = 0.0 if action == 'BUY' else (1000.0 / current_price if current_price > 0 else 0.0)
+                balance_usd_before = float(INITIAL_CAPITAL_USD) if action == 'BUY' else 0.0
+                balance_doge_before = (
+                    0.0 if action == 'BUY' else (float(INITIAL_CAPITAL_USD) / current_price if current_price > 0 else 0.0)
+                )
         except Exception as e:
             print(f"⚠️  Could not get balances from database: {e}")
-            balance_usd_before = 1000.0 if action == 'BUY' else 0.0
-            balance_doge_before = 0.0 if action == 'BUY' else (1000.0 / current_price if current_price > 0 else 0.0)
+            balance_usd_before = float(INITIAL_CAPITAL_USD) if action == 'BUY' else 0.0
+            balance_doge_before = (
+                0.0 if action == 'BUY' else (float(INITIAL_CAPITAL_USD) / current_price if current_price > 0 else 0.0)
+            )
         
         # Simulate trade execution
         trade_result = self.simulate_trade_execution(
@@ -2138,6 +2413,12 @@ class DogecoinAnalyzer:
                 percentage = self.latest_analysis_json.get('percentage')
                 
                 if recommendation == 'BUY' and percentage is not None:
+                    # ATR-based volatility cap on position size
+                    if self._latest_chart_data:
+                        original_pct = percentage
+                        percentage = self._atr_capped_percentage(self._latest_chart_data, percentage)
+                        if percentage != original_pct:
+                            print(f"  📐 ATR cap: LLM suggested {original_pct}% → capped to {percentage}% (vol-adjusted)")
                     print(f"\n🤖 AI Recommendation: BUY {percentage}% of portfolio")
                     # Check if we have API credentials (trade_executor available)
                     if self.trade_executor is None:
@@ -2181,6 +2462,11 @@ class DogecoinAnalyzer:
                     
                     return order_result is not None
                 elif recommendation == 'SELL' and percentage is not None:
+                    if self._latest_chart_data:
+                        original_pct = percentage
+                        percentage = self._atr_capped_percentage(self._latest_chart_data, percentage)
+                        if percentage != original_pct:
+                            print(f"  📐 ATR cap: LLM suggested {original_pct}% → capped to {percentage}% (vol-adjusted)")
                     print(f"\n🤖 AI Recommendation: SELL {percentage}% of holdings")
                     # Check if we have API credentials (trade_executor available)
                     if self.trade_executor is None:
@@ -2360,15 +2646,30 @@ class DogecoinAnalyzer:
             # Fetch current Fear & Greed Index
             fear_greed_data = self.fetch_fear_and_greed_index(5)
         
-        # Skip news data if requested (useful for simulations)
+        # News: use at most once per calendar day to save SerpAPI cost (script runs every 6 hours)
         news_data = None
         news_sentiment = None
         if not skip_news_data:
-            print("📰 Fetching cryptocurrency news...")
-            news_data = self.fetch_crypto_news(10)
-        if news_data:
-            print("🔍 Analyzing news sentiment...")
-            news_sentiment = self.analyze_news_sentiment(news_data)
+            from datetime import date as date_type
+            today_str = (simulation_date.date() if simulation_date else date_type.today()).strftime('%Y-%m-%d')
+            cached_news, cached_sentiment = None, None
+            if self.database_enabled and self.db:
+                cached_news, cached_sentiment = self.db.get_cached_news_for_date(today_str)
+            if cached_news is not None and cached_sentiment is not None:
+                news_data = cached_news
+                news_sentiment = cached_sentiment
+                print("📰 Using cached news for today (once-per-day to save API cost)")
+            else:
+                print("📰 Fetching cryptocurrency news...")
+                news_data = self.fetch_crypto_news(10)
+                if news_data:
+                    print("🔍 Analyzing news sentiment...")
+                    news_sentiment = self.analyze_news_sentiment(news_data)
+                    if self.database_enabled and self.db and news_data:
+                        try:
+                            self.db.save_news_cache(today_str, news_data, news_sentiment)
+                        except Exception as e:
+                            print(f"⚠️  Could not cache news for today: {e}")
         else:
             print("⏭️  Skipping news data for simulation")
         
@@ -2419,6 +2720,46 @@ class DogecoinAnalyzer:
         # Display comprehensive summary
         self.display_comprehensive_summary(comprehensive_data)
         
+        # ── Circuit Breakers: check BEFORE calling the LLM ──
+        cb_tripped = self._check_circuit_breakers(comprehensive_data)
+        if cb_tripped:
+            print("\n" + "=" * 60)
+            print("🚨 CIRCUIT BREAKER(S) TRIPPED — LLM call may be constrained")
+            print("=" * 60)
+            for tag, msg in cb_tripped:
+                print(f"  [{tag}] {msg}")
+            print("=" * 60 + "\n")
+
+            # If EXTREME_VOL or DRAWDOWN tripped, skip LLM entirely → force HOLD
+            force_hold_tags = {"EXTREME_VOL", "DRAWDOWN"}
+            if force_hold_tags & {t for t, _ in cb_tripped}:
+                print("⛔ Force HOLD — skipping LLM analysis this cycle.")
+                analysis = '{"recommendation": "HOLD", "percentage": null, "confidence_level": "High", ' \
+                           '"reasoning": "Circuit breaker: ' + "; ".join(m for _, m in cb_tripped) + '"}'
+                self.latest_analysis_json = {"recommendation": "HOLD", "percentage": None,
+                                             "confidence_level": "High",
+                                             "reasoning": "Circuit breaker: " + "; ".join(m for _, m in cb_tripped)}
+                # Save analysis to DB
+                analysis_id = None
+                if self.database_enabled:
+                    try:
+                        analysis_id = self.db.save_analysis_result(
+                            self.latest_analysis_json, market_data_id=market_data_id)
+                    except Exception:
+                        pass
+                print("\n" + "=" * 60)
+                print("🎯 DOGECOIN INVESTMENT ANALYSIS")
+                print("=" * 60)
+                print("📋 QUICK SUMMARY: HOLD (circuit breaker)")
+                print("=" * 60)
+                return analysis
+
+            # Otherwise (INVENTORY, ADX_DOWNTREND): inject constraints into chart_data for the LLM
+            comprehensive_data['_circuit_breaker_constraints'] = cb_tripped
+
+        # Store for ATR-based position capping during execution
+        self._latest_chart_data = comprehensive_data
+
         # Get ChatGPT analysis
         print("🤖 Getting comprehensive AI analysis from ChatGPT...")
         analysis = self.analyze_with_chatgpt(comprehensive_data, skip_chart_capture=skip_chart_capture)
@@ -2578,8 +2919,8 @@ class DogecoinAnalyzer:
         else:
             target_dt = target_date
         
-        # Start with initial balances: $500 USD + $500 worth of DOGE
-        initial_usd_value = 500.0
+        # Start with $1000 USD cash, 0 DOGE; replay trades to target_date
+        initial_usd_value = float(INITIAL_CAPITAL_USD)
         
         # Get price at the start (first simulation date or reference date)
         # For simplicity, use a reference point - if we have trades, use first trade date
@@ -2592,13 +2933,11 @@ class DogecoinAnalyzer:
         
         if initial_price_data:
             initial_price = initial_price_data['close']
-            initial_doge_balance = (500.0 / initial_price) if initial_price > 0 else 0.0
         else:
             initial_price = 0.0
-            initial_doge_balance = 0.0
         
         usd_balance = initial_usd_value
-        doge_balance = initial_doge_balance
+        doge_balance = 0.0
         
         # Replay trades up to target_date
         if all_trades is None:
@@ -2675,9 +3014,8 @@ class DogecoinAnalyzer:
         # Get all trades once for efficiency
         all_trades = self.db.get_all_trades()
         
-        # Calculate initial portfolio value (starting balance)
-        # Initial: $500 USD + $500 worth of DOGE
-        initial_usd_value = 500.0
+        # Calculate initial portfolio value (starting balance): $1000 USD cash, 0 DOGE at first trade
+        initial_usd_value = float(INITIAL_CAPITAL_USD)
         # Get first trade date - this is when simulation actually started
         from datetime import datetime as dt_class
         first_trade_timestamp = None
@@ -2692,10 +3030,12 @@ class DogecoinAnalyzer:
         
         if initial_price_data:
             initial_price = initial_price_data['close']
-            initial_doge_balance = (500.0 / initial_price) if initial_price > 0 else 0.0
-            initial_portfolio_value = initial_usd_value + (initial_doge_balance * initial_price)
+            initial_doge_balance = 0.0
+            initial_portfolio_value = initial_usd_value
         else:
-            initial_portfolio_value = 1000.0  # Default: $500 USD + $500 DOGE value
+            initial_price = 0.0
+            initial_doge_balance = 0.0
+            initial_portfolio_value = float(INITIAL_CAPITAL_USD)
         
         # Calculate days since first trade (simulation duration)
         if first_trade_timestamp:
@@ -2707,6 +3047,7 @@ class DogecoinAnalyzer:
         periods = {
             '1d': 1,
             '5d': 5,
+            '10d': 10,
             '1m': 30,
             '3m': 90,
             '6m': 180,
@@ -2790,9 +3131,11 @@ class DogecoinAnalyzer:
                         else:
                             continue
                 
-                # Calculate buy-and-hold portfolio value at current date
-                # Buy-and-hold: initial USD + initial DOGE * current price
-                buy_hold_current_value = initial_usd_value + (initial_doge_balance * current_price)
+                # Buy-and-hold: put all initial capital in DOGE at first-trade price, mark at market
+                buy_hold_doge_units = (
+                    (INITIAL_CAPITAL_USD / initial_price) if initial_price and initial_price > 0 else 0.0
+                )
+                buy_hold_current_value = buy_hold_doge_units * current_price
                 
                 # Calculate trading performance
                 # Trading performance = (actual portfolio - buy-and-hold portfolio) / buy-and-hold portfolio * 100
@@ -2809,15 +3152,14 @@ class DogecoinAnalyzer:
                 else:
                     # For specific periods, we need buy-and-hold at start of period
                     # Calculate buy-and-hold portfolio value at start of period
-                    # Buy-and-hold: initial USD + initial DOGE * price at period start
+                    # Buy-and-hold at period start: same DOGE units × start price
                     start_price_data = self.fetch_historical_price_at_timestamp(period_start_date)
                     if not start_price_data:
                         start_price_data = self.fetch_historical_price_at_timestamp(first_trade_timestamp) if first_trade_timestamp else None
                     
                     if start_price_data:
                         start_price = start_price_data['close']
-                        # Buy-and-hold portfolio: initial $500 USD + initial $500 worth of DOGE
-                        buy_hold_start_value = initial_usd_value + (initial_doge_balance * start_price)
+                        buy_hold_start_value = buy_hold_doge_units * start_price
                     else:
                         buy_hold_start_value = initial_portfolio_value
                     
@@ -3690,7 +4032,9 @@ Limit your response to 300 words or less.
         
         # Use provided balances or fall back to current balances/defaults
         if balance_usd_before is None:
-            balance_usd_before = self.trade_executor.get_usd_balance() if self.trade_executor else 1000.0
+            balance_usd_before = (
+                self.trade_executor.get_usd_balance() if self.trade_executor else float(INITIAL_CAPITAL_USD)
+            )
         if balance_doge_before is None:
             balance_doge_before = self.trade_executor.get_dogecoin_balance() if self.trade_executor else 0.0
         
@@ -3769,30 +4113,20 @@ Limit your response to 300 words or less.
         print(f"Last simulation: {simulation_times[-1]}")
         print("-"*70)
         
-        # Initialize running balances for simulation (starting portfolio state)
-        # Start with $500 USD and $500 worth of DOGE (50/50 split)
-        initial_usd_value = 500.0
-        target_doge_value = 500.0
-        
-        # Get the price at the first simulation time to calculate initial DOGE balance
+        # Initialize running balances: $1000 USD cash, 0 DOGE (same as INITIAL_CAPITAL_USD story)
         first_sim_time = simulation_times[0]
         initial_price_data = self.fetch_historical_price_at_timestamp(first_sim_time)
+        running_balance_usd = float(INITIAL_CAPITAL_USD)
+        running_balance_doge = 0.0
         if initial_price_data:
             initial_price = initial_price_data['close']
-            running_balance_usd = initial_usd_value
-            running_balance_doge = target_doge_value / initial_price if initial_price > 0 else 0.0
-            print(f"\n💰 Starting simulation with initial balances (at {first_sim_time.strftime('%Y-%m-%d %H:%M')}):")
+            print(f"\n💰 Starting simulation (at {first_sim_time.strftime('%Y-%m-%d %H:%M')}):")
             print(f"   USD Balance: ${running_balance_usd:.2f}")
             print(f"   DOGE Balance: {running_balance_doge:.6f} DOGE")
-            print(f"   DOGE Value: ${target_doge_value:.2f} (at ${initial_price:.6f}/DOGE)")
-            print(f"   Total Portfolio Value: ${running_balance_usd + target_doge_value:.2f}")
+            print(f"   Spot (reference): ${initial_price:.6f}/DOGE")
+            print(f"   Total Portfolio Value: ${running_balance_usd:.2f} (all cash)")
         else:
-            # Fallback if we can't get historical price
-            running_balance_usd = initial_usd_value
-            running_balance_doge = 0.0
-            print(f"\n💰 Starting simulation with:")
-            print(f"   USD Balance: ${running_balance_usd:.2f}")
-            print(f"   DOGE Balance: {running_balance_doge:.6f} (could not fetch historical price)")
+            print(f"\n💰 Starting simulation with ${running_balance_usd:.2f} USD, 0 DOGE (could not fetch historical price)")
         print("-"*70)
         
         total_simulations = len(simulation_times)
@@ -4019,13 +4353,12 @@ Limit your response to 300 words or less.
                 initial_price_data = self.fetch_historical_price_at_timestamp(first_sim_time)
                 if initial_price_data:
                     initial_price = initial_price_data['close']
-                    initial_usd_value = 500.0
-                    initial_doge_value = 500.0
-                    initial_portfolio_value = initial_usd_value + initial_doge_value
-                    
-                    # Calculate buy-and-hold value (initial DOGE at current price)
-                    buy_hold_doge_value = initial_doge_value * (final_price / initial_price)
-                    buy_hold_portfolio_value = initial_usd_value + buy_hold_doge_value
+                    initial_portfolio_value = float(INITIAL_CAPITAL_USD)
+                    # Buy-and-hold: all initial capital in DOGE at first sim price, marked at final price
+                    buy_hold_doge_units = (
+                        (INITIAL_CAPITAL_USD / initial_price) if initial_price > 0 else 0.0
+                    )
+                    buy_hold_portfolio_value = buy_hold_doge_units * final_price
                     
                     # Calculate trading performance
                     trading_value_added = final_portfolio_value - buy_hold_portfolio_value
@@ -4065,6 +4398,177 @@ Limit your response to 300 words or less.
                             print(f"   {symbol} {period_label}: {value:+.2f}%")
         
         print("="*70)
+
+
+def _amounts_from_stored_order_json(order_details_json, action, current_price):
+    """Recover requested IOC sizes from Coinbase create-order JSON when fill fields were not stored."""
+    if not order_details_json or current_price is None:
+        return None, None
+    try:
+        o = json.loads(order_details_json) if isinstance(order_details_json, str) else order_details_json
+    except (json.JSONDecodeError, TypeError):
+        return None, None
+    oc = o.get('order_configuration') or {}
+    mmc = oc.get('market_market_ioc') or {}
+    act = (action or '').upper()
+    try:
+        cp = float(current_price)
+        if cp <= 0:
+            return None, None
+    except (TypeError, ValueError):
+        return None, None
+    try:
+        if act == 'BUY':
+            qs = mmc.get('quote_size')
+            if qs is None:
+                return None, None
+            usd = float(qs)
+            return usd, usd / cp
+        if act == 'SELL':
+            bs = mmc.get('base_size')
+            if bs is None:
+                return None, None
+            doge = float(bs)
+            return doge * cp, doge
+    except (TypeError, ValueError):
+        return None, None
+    return None, None
+
+
+def _resolved_trade_amounts(row):
+    """Use stored fill amounts, or infer USD/DOGE moved from before/after balances."""
+    amt_usd = row['amount_usd']
+    amt_doge = row['amount_doge']
+    if amt_usd is not None or amt_doge is not None:
+        return amt_usd, amt_doge
+    ju, jd = _amounts_from_stored_order_json(
+        row['order_details_json'], row['action'], row['current_price']
+    )
+    if ju is not None or jd is not None:
+        return ju, jd
+    action = (row['action'] or '').upper()
+    u0, u1 = row['balance_usd_before'], row['balance_usd_after']
+    d0, d1 = row['balance_doge_before'], row['balance_doge_after']
+    if any(x is None for x in (u0, u1, d0, d1)):
+        return None, None
+    if action == 'BUY':
+        du = u0 - u1
+        dd = d1 - d0
+        return (du if du > 1e-10 else None), (dd if dd > 1e-10 else None)
+    if action == 'SELL':
+        dd = d0 - d1
+        du = u1 - u0
+        return (du if du > 1e-10 else None), (dd if dd > 1e-10 else None)
+    return None, None
+
+
+def _execution_price_per_doge(row):
+    """This row's implied execution $/DOGE from resolved sizes (USD÷DOGE), or None."""
+    u, d = _resolved_trade_amounts(row)
+    if u is None or d is None or d <= 0:
+        return None
+    return float(u) / float(d)
+
+
+def _replay_avg_cost_basis_per_trade(rows_asc):
+    """
+    Replay successful BUY/SELL with resolved sizes (average-cost method).
+    Returns:
+      - by_id: average $/DOGE cost basis on **remaining** DOGE after each row (failed rows: unchanged state)
+      - final_avg, final_hold_doge: after full history
+      - buy_vwap: Σ USD on successful BUYs ÷ Σ DOGE on those buys
+    """
+    basis_usd = 0.0
+    hold_doge = 0.0
+    buy_usd = 0.0
+    buy_doge = 0.0
+    by_id = {}
+    for row in rows_asc:
+        rid = int(row["id"])
+        if row["success"]:
+            act = (row["action"] or "").upper()
+            u, d = _resolved_trade_amounts(row)
+            if u is not None and d is not None and d > 0:
+                u, d = float(u), float(d)
+                if act == "BUY":
+                    buy_usd += u
+                    buy_doge += d
+                    basis_usd += u
+                    hold_doge += d
+                elif act == "SELL" and hold_doge > 1e-12:
+                    sold = min(d, hold_doge)
+                    avg = basis_usd / hold_doge
+                    basis_usd -= avg * sold
+                    hold_doge -= sold
+        ac = (basis_usd / hold_doge) if hold_doge > 1e-10 else None
+        by_id[rid] = ac
+    bvwap = (buy_usd / buy_doge) if buy_doge > 1e-10 else None
+    final_ac = (basis_usd / hold_doge) if hold_doge > 1e-10 else None
+    return by_id, final_ac, hold_doge, bvwap
+
+
+def show_previous_trades(analyzer, limit=30):
+    """Print previous transactions from the database."""
+    if not getattr(analyzer, 'database_enabled', False) or not getattr(analyzer, 'db', None):
+        print("❌ Database not available - cannot show trades")
+        return
+    trades = analyzer.db.get_recent_trades(limit=limit)
+    if not trades:
+        print("No previous transactions found.")
+        return
+    print()
+    print("=" * 104)
+    print("  PREVIOUS TRANSACTIONS")
+    print("=" * 104)
+    all_rows = analyzer.db.get_all_trades()
+    avg_cost_by_id, final_avg, hold_model, buy_vwap = _replay_avg_cost_basis_per_trade(all_rows)
+
+    # Amounts: DB fills, or inferred from balance before/after. Exec = this row's USD÷DOGE; Avg cost = basis after row.
+    print(
+        f"  {'Date':<22} {'Action':<6} {'Pct':<6} {'Amount USD':<12} {'Amount DOGE':<14} "
+        f"{'Exec $/DOGE':<14} {'Avg cost $/DOGE':<14} {'Status':<8}  Balances after"
+    )
+    print("  " + "-" * 112)
+    for row in trades:
+        ts = row['timestamp'][:19].replace('T', ' ') if row['timestamp'] else ''
+        action = (row['action'] or '')[:6]
+        pct = row['percentage']
+        pct_s = f"{pct:.0f}%" if pct is not None else "—"
+        amt_usd, amt_doge = _resolved_trade_amounts(row)
+        amt_usd_s = f"${amt_usd:,.2f}" if amt_usd is not None else "—"
+        amt_doge_s = f"{amt_doge:,.2f}" if amt_doge is not None else "—"
+        rid = int(row["id"])
+        ac = avg_cost_by_id.get(rid)
+        ac_s = f"${ac:.6f}" if ac is not None else "—"
+        ex = _execution_price_per_doge(row)
+        ex_s = f"${ex:.6f}" if ex is not None else "—"
+        success = "✅" if row['success'] else "❌"
+        bal_usd = row['balance_usd_after']
+        bal_doge = row['balance_doge_after']
+        bal_s = f"${bal_usd:,.0f} / {bal_doge:,.0f} DOGE" if bal_usd is not None and bal_doge is not None else "—"
+        print(
+            f"  {ts:<22} {action:<6} {pct_s:<6} {amt_usd_s:<12} {amt_doge_s:<14} "
+            f"{ex_s:<14} {ac_s:<14} {success:<8}  {bal_s}"
+        )
+    print("=" * 104)
+    print(f"  Showing {len(trades)} most recent transaction(s)")
+    print("  Amount USD/DOGE: stored fills; else Coinbase order quote_size/base_size (+ spot for other leg); else balance deltas.")
+    print(
+        "  Exec $/DOGE = this row's execution unit price (USD÷DOGE from resolved sizes) when amounts are known."
+    )
+    print(
+        "  Avg cost $/DOGE = average-cost basis on remaining DOGE after this row (replay of successful trades only)."
+    )
+    if buy_vwap is not None:
+        print(
+            f"  Buy VWAP (Σ USD on successful BUYs ÷ Σ DOGE on those buys, all history): ${buy_vwap:.6f} / DOGE"
+        )
+    if final_avg is not None:
+        print(
+            f"  Modeled avg cost after all rows: ${final_avg:.6f} / DOGE  (~{hold_model:,.2f} DOGE in replay vs ledger)"
+        )
+    print()
+
 
 def main():
     """Main function to run the Dogecoin analysis."""
@@ -4106,6 +4610,10 @@ def main():
                     analyzer.execute_manual_trade(action, percentage)
                 except ValueError:
                     print(f"❌ Invalid percentage: {sys.argv[3]}. Must be a number.")
+            elif sys.argv[1] == '--trades':
+                # Show previous transactions
+                limit = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+                show_previous_trades(analyzer, limit=limit)
             else:
                 print(f"Unknown argument: {sys.argv[1]}")
                 print("Available options:")
@@ -4115,6 +4623,7 @@ def main():
                 print("  --review-reflections               : Review and add reflections to past trades")
                 print("  --generate-dataset [days] [format]: Generate training dataset (default: 7 days, sqlite)")
                 print("  --manual-trade <BUY|SELL> <pct>  : Manually execute a trade (e.g., --manual-trade SELL 20)")
+                print("  --trades [limit]                  : Show previous transactions (default: 30)")
         else:
             analysis = analyzer.run_analysis()
         

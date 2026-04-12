@@ -128,6 +128,16 @@ class TradingDatabase:
             )
         """)
         
+        # Table for once-per-day news cache (SerpAPI cost savings when running every 6 hours)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS news_cache (
+                cache_date TEXT PRIMARY KEY,
+                news_data_json TEXT NOT NULL,
+                news_sentiment_text TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         # Add new columns to existing table if they don't exist (migration)
         try:
             cursor.execute("ALTER TABLE trade_executions ADD COLUMN reflection TEXT")
@@ -345,24 +355,85 @@ class TradingDatabase:
         amount_usd = None
         amount_doge = None
         order_details_json = None
-        
-        if order_result:
-            order_id = order_result.get('id')
-            order_status = order_result.get('status')
-            
-            # Extract amounts from order result
-            filled_size = order_result.get('filled_size')
-            executed_value = order_result.get('executed_value')
-            
-            if action.upper() == 'BUY':
-                amount_usd = executed_value if executed_value else None
-                amount_doge = float(filled_size) if filled_size else None
-            elif action.upper() == 'SELL':
-                amount_doge = float(filled_size) if filled_size else None
-                amount_usd = executed_value if executed_value else None
-            
+
+        def _to_float(v):
+            if v is None:
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        act = action.upper()
+
+        if order_result and isinstance(order_result, dict):
+            # Coinbase Advanced Trade wraps the order in success_response; fill fields are often absent here.
+            sr = order_result.get('success_response') or {}
+            order_id = (
+                sr.get('order_id')
+                or order_result.get('order_id')
+                or order_result.get('id')
+            )
+            order_status = sr.get('status') or order_result.get('status')
+
+            filled_size = (
+                order_result.get('filled_size')
+                or sr.get('filled_size')
+                or sr.get('filled_quantity')
+            )
+            executed_value = (
+                order_result.get('executed_value')
+                or sr.get('executed_value')
+                or sr.get('filled_value')
+            )
+
+            filled_f = _to_float(filled_size)
+            exec_f = _to_float(executed_value)
+
+            if act == 'BUY':
+                amount_usd = exec_f
+                amount_doge = filled_f
+            elif act == 'SELL':
+                amount_doge = filled_f
+                amount_usd = exec_f
+
             order_details_json = json.dumps(order_result)
-        
+
+        # Coinbase market IOC create response often omits fills; sizes are in order_configuration.
+        if order_result and isinstance(order_result, dict):
+            oc = order_result.get('order_configuration') or {}
+            mmc = oc.get('market_market_ioc') or {}
+            if act == 'BUY':
+                if amount_usd is None:
+                    amount_usd = _to_float(mmc.get('quote_size'))
+                if amount_doge is None and amount_usd is not None and current_price and current_price > 0:
+                    amount_doge = amount_usd / current_price
+            elif act == 'SELL':
+                if amount_doge is None:
+                    amount_doge = _to_float(mmc.get('base_size'))
+                if amount_usd is None and amount_doge is not None and current_price and current_price > 0:
+                    amount_usd = amount_doge * current_price
+
+        # When the API response omits fills, infer from wallet snapshots (same moment as trade save).
+        if act == 'BUY':
+            if amount_doge is None and balance_doge_before is not None and balance_doge_after is not None:
+                d_doge = balance_doge_after - balance_doge_before
+                if d_doge > 1e-10:
+                    amount_doge = d_doge
+            if amount_usd is None and balance_usd_before is not None and balance_usd_after is not None:
+                d_usd = balance_usd_before - balance_usd_after
+                if d_usd > 1e-10:
+                    amount_usd = d_usd
+        elif act == 'SELL':
+            if amount_doge is None and balance_doge_before is not None and balance_doge_after is not None:
+                d_doge = balance_doge_before - balance_doge_after
+                if d_doge > 1e-10:
+                    amount_doge = d_doge
+            if amount_usd is None and balance_usd_before is not None and balance_usd_after is not None:
+                d_usd = balance_usd_after - balance_usd_before
+                if d_usd > 1e-10:
+                    amount_usd = d_usd
+
         success = 1 if order_result is not None and error_message is None else 0
         
         # Set reflection timestamp if reflection is provided
@@ -533,6 +604,38 @@ class TradingDatabase:
             WHERE id = ?
         """, (market_data_id,))
         return cursor.fetchone()
+    
+    def get_cached_news_for_date(self, cache_date: str):
+        """
+        Get cached news and sentiment for a calendar date (YYYY-MM-DD).
+        Used to avoid SerpAPI cost when running mvp.py every 6 hours.
+        
+        Returns:
+            Tuple of (news_data dict, news_sentiment str) or (None, None) if not found
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT news_data_json, news_sentiment_text FROM news_cache WHERE cache_date = ?
+        """, (cache_date,))
+        row = cursor.fetchone()
+        if not row:
+            return None, None
+        try:
+            news_data = json.loads(row[0]) if row[0] else None
+            news_sentiment = row[1] if row[1] else None
+            return news_data, news_sentiment
+        except (json.JSONDecodeError, TypeError):
+            return None, None
+    
+    def save_news_cache(self, cache_date: str, news_data: Dict[str, Any], news_sentiment: Optional[str] = None):
+        """Save news data and sentiment for a calendar date (YYYY-MM-DD)."""
+        cursor = self.conn.cursor()
+        news_json = json.dumps(news_data) if news_data else "{}"
+        cursor.execute("""
+            INSERT OR REPLACE INTO news_cache (cache_date, news_data_json, news_sentiment_text, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (cache_date, news_json, news_sentiment, datetime.now().isoformat()))
+        self.conn.commit()
     
     def get_all_trades(self, days: Optional[int] = None):
         """

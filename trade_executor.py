@@ -17,6 +17,9 @@ from coinbase import jwt_generator
 # Load environment variables
 load_dotenv()
 
+# Coinbase Advanced Trade minimum order size (quote) for DOGE-USD is $1; use slightly higher to avoid rejections
+MIN_BUY_USD = 2.0
+
 class CoinbaseTradeExecutor:
     def __init__(self):
         """Initialize the trade executor with Coinbase Advanced API credentials.
@@ -525,6 +528,9 @@ class CoinbaseTradeExecutor:
             amount_to_spend = current_balance_usd * (percentage / 100)
             if amount_to_spend > current_balance_usd:
                 print(f"❌ Insufficient USD balance. Need ${amount_to_spend:.2f}, have ${current_balance_usd:.2f}")
+                return False
+            if amount_to_spend < MIN_BUY_USD:
+                print(f"⏭️  Skipping BUY: amount ${amount_to_spend:.2f} is below minimum order size (${MIN_BUY_USD:.2f}). Add more USD to trade.")
                 return False
             
             print(f"💵 Buying DOGE worth ${amount_to_spend:.2f} ({percentage}% of USD balance)")
