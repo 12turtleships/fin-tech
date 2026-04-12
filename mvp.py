@@ -4625,7 +4625,12 @@ def main():
                 print("  --manual-trade <BUY|SELL> <pct>  : Manually execute a trade (e.g., --manual-trade SELL 20)")
                 print("  --trades [limit]                  : Show previous transactions (default: 30)")
         else:
-            analysis = analyzer.run_analysis()
+            # GitHub Actions: skip Selenium chart + SerpAPI news (unreliable / costly on CI runners).
+            on_gha = (os.environ.get("GITHUB_ACTIONS", "").lower() == "true")
+            analysis = analyzer.run_analysis(
+                skip_chart_capture=on_gha,
+                skip_news_data=on_gha,
+            )
         
     except ValueError as e:
         print(f"❌ Configuration Error: {e}")
