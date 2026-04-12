@@ -1567,12 +1567,12 @@ class DogecoinAnalyzer:
 
         **CURRENT POSITION:**
         - Portfolio: ${chart_data['investment_status'].get('portfolio_value', 'N/A')}
-        - USD: ${(chart_data['investment_status'].get('current_balances', {{}}).get('usd') or 0):.2f} ({chart_data['investment_status'].get('current_allocation', {{}}).get('usd_percentage', 'N/A')}%)
-        - DOGE (USD): ${(chart_data['investment_status'].get('current_balances', {{}}).get('doge_value_usd') or 0):.2f} ({chart_data['investment_status'].get('current_allocation', {{}}).get('doge_percentage', 'N/A')}%)
+        - USD: ${(chart_data['investment_status'].get('current_balances', dict()).get('usd') or 0):.2f} ({chart_data['investment_status'].get('current_allocation', dict()).get('usd_percentage', 'N/A')}%)
+        - DOGE (USD): ${(chart_data['investment_status'].get('current_balances', dict()).get('doge_value_usd') or 0):.2f} ({chart_data['investment_status'].get('current_allocation', dict()).get('doge_percentage', 'N/A')}%)
         - Consecutive successful BUYs (newest): **{buy_streak}** (if >= 3: BUY is FORBIDDEN — see system prompt rule 6)
 
         **SENTIMENT:**
-        - Fear & Greed: {chart_data['fear_greed_index'].get('current', {{}}).get('value', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'} ({chart_data['fear_greed_index'].get('current', {{}}).get('classification', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'})
+        - Fear & Greed: {chart_data['fear_greed_index'].get('current', dict()).get('value', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'} ({chart_data['fear_greed_index'].get('current', dict()).get('classification', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'})
 
         **Order Book:** Spread: ${chart_data['order_book'].get('spread', 'N/A')} ({chart_data['order_book'].get('spread_percent', 'N/A')}%) | Imbalance: {chart_data['order_book'].get('volume_imbalance', 'N/A')}%
 {trade_learning_block}{dry_powder_block}
