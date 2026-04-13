@@ -76,4 +76,11 @@ Use this if your **Mac sleeps** and `cron` only fires when the machine is awake.
 
 **Manual run:** GitHub → **Actions** → **DOGE MVP scheduled** → **Run workflow**.
 
+Each run uploads **`trading_data_db`** (SQLite) as a workflow artifact. To view **the same trade history as CI** on your Mac:
+
+1. Download the latest artifact from **Actions** → your run → **Artifacts** → `trading_data_db`.
+2. Unzip and note the path to `trading_data.db`.
+3. Either export `REMOTE_TRADING_DATA_DB=/path/to/trading_data.db` and run `python mvp.py --trades 50`, or use `python mvp.py --trades 50 --db /path/to/trading_data.db`.
+4. Use `--local` to force the project’s own `trading_data.db` when `REMOTE_TRADING_DATA_DB` is set.
+
 If you rely on GitHub Actions, you can **comment out** the Mac `crontab` line to avoid double-trading, or disable trading in one environment only (not implemented here — use env flags / separate Coinbase keys if you need that).

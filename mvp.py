@@ -4507,12 +4507,79 @@ def _replay_avg_cost_basis_per_trade(rows_asc):
     return by_id, final_ac, hold_doge, bvwap
 
 
-def show_previous_trades(analyzer, limit=30):
-    """Print previous transactions from the database."""
-    if not getattr(analyzer, 'database_enabled', False) or not getattr(analyzer, 'db', None):
-        print("❌ Database not available - cannot show trades")
+def _parse_trades_cli(argv):
+    """Parse argv after `--trades`: [limit] [--local|--remote] [--db PATH]."""
+    limit = 30
+    mode = "auto"  # auto: REMOTE_TRADING_DATA_DB if set, else local default
+    db_explicit = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--remote":
+            mode = "remote"
+            i += 1
+        elif a == "--local":
+            mode = "local"
+            i += 1
+        elif a == "--db" and i + 1 < len(argv):
+            db_explicit = argv[i + 1]
+            i += 2
+        else:
+            try:
+                limit = int(a)
+            except ValueError:
+                print(f"⚠️  Unknown --trades argument ignored: {a}")
+            i += 1
+    return limit, mode, db_explicit
+
+
+def _resolve_trades_db_path(mode: str, db_explicit: Optional[str]) -> Optional[str]:
+    """
+    Return absolute path string for TradingDatabase, or None for default local DB.
+    None = use TradingDatabase default (trading_data.db next to this package).
+    """
+    if db_explicit:
+        p = Path(db_explicit).expanduser().resolve()
+        if not p.is_file():
+            print(f"❌ --db file not found: {p}")
+            return "__missing__"
+        return str(p)
+    if mode == "local":
+        return None
+    if mode == "remote":
+        raw = os.getenv("REMOTE_TRADING_DATA_DB", "").strip()
+        if not raw:
+            print(
+                "❌ --remote requires REMOTE_TRADING_DATA_DB in the environment "
+                "(path to SQLite, e.g. after downloading the GitHub Actions artifact)."
+            )
+            return "__missing__"
+        p = Path(raw).expanduser().resolve()
+        if not p.is_file():
+            print(f"❌ REMOTE_TRADING_DATA_DB not found: {p}")
+            return "__missing__"
+        return str(p)
+    # auto
+    raw = os.getenv("REMOTE_TRADING_DATA_DB", "").strip()
+    if raw:
+        p = Path(raw).expanduser().resolve()
+        if p.is_file():
+            return str(p)
+        print(f"⚠️  REMOTE_TRADING_DATA_DB set but file missing ({p}); using local trading_data.db")
+    return None
+
+
+def show_previous_trades(limit=30, db_path: Optional[str] = None):
+    """Print previous transactions from SQLite (no OpenAI/Coinbase needed)."""
+    if db_path == "__missing__":
         return
-    trades = analyzer.db.get_recent_trades(limit=limit)
+    try:
+        db = TradingDatabase(db_path) if db_path else TradingDatabase()
+    except Exception as e:
+        print(f"❌ Could not open database: {e}")
+        return
+    print(f"📂 Trade history database: {Path(db.db_path).resolve()}")
+    trades = db.get_recent_trades(limit=limit)
     if not trades:
         print("No previous transactions found.")
         return
@@ -4520,7 +4587,7 @@ def show_previous_trades(analyzer, limit=30):
     print("=" * 104)
     print("  PREVIOUS TRANSACTIONS")
     print("=" * 104)
-    all_rows = analyzer.db.get_all_trades()
+    all_rows = db.get_all_trades()
     avg_cost_by_id, final_avg, hold_model, buy_vwap = _replay_avg_cost_basis_per_trade(all_rows)
 
     # Amounts: DB fills, or inferred from balance before/after. Exec = this row's USD÷DOGE; Avg cost = basis after row.
@@ -4573,6 +4640,13 @@ def show_previous_trades(analyzer, limit=30):
 def main():
     """Main function to run the Dogecoin analysis."""
     import sys
+
+    # Trade list only needs SQLite — skip OpenAI/Coinbase init (supports CI DB via REMOTE_TRADING_DATA_DB).
+    if len(sys.argv) > 1 and sys.argv[1] == "--trades":
+        limit, mode, db_explicit = _parse_trades_cli(sys.argv[2:])
+        resolved = _resolve_trades_db_path(mode, db_explicit)
+        show_previous_trades(limit=limit, db_path=resolved)
+        return
     
     try:
         analyzer = DogecoinAnalyzer()
@@ -4610,10 +4684,6 @@ def main():
                     analyzer.execute_manual_trade(action, percentage)
                 except ValueError:
                     print(f"❌ Invalid percentage: {sys.argv[3]}. Must be a number.")
-            elif sys.argv[1] == '--trades':
-                # Show previous transactions
-                limit = int(sys.argv[2]) if len(sys.argv) > 2 else 30
-                show_previous_trades(analyzer, limit=limit)
             else:
                 print(f"Unknown argument: {sys.argv[1]}")
                 print("Available options:")
@@ -4623,7 +4693,9 @@ def main():
                 print("  --review-reflections               : Review and add reflections to past trades")
                 print("  --generate-dataset [days] [format]: Generate training dataset (default: 7 days, sqlite)")
                 print("  --manual-trade <BUY|SELL> <pct>  : Manually execute a trade (e.g., --manual-trade SELL 20)")
-                print("  --trades [limit]                  : Show previous transactions (default: 30)")
+                print("  --trades [limit] [--local|--remote] [--db PATH]  : Show trades (default: local DB)")
+                print("      Uses REMOTE_TRADING_DATA_DB when set unless --local. --remote requires that env.")
+                print("      GitHub Actions: download artifact `trading_data_db`, set REMOTE_TRADING_DATA_DB to the .db path.")
         else:
             # GitHub Actions: skip Selenium chart + SerpAPI news (unreliable / costly on CI runners).
             on_gha = (os.environ.get("GITHUB_ACTIONS", "").lower() == "true")

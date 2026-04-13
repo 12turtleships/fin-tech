@@ -53,3 +53,12 @@ jobs:
 
       - name: Run MVP
         run: python mvp.py
+
+      # Lets you run `mvp.py --trades` locally against the same SQLite the runner used (download this artifact).
+      - name: Upload trading_data.db artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trading_data_db
+          path: trading_data.db
+          if-no-files-found: ignore
