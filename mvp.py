@@ -35,8 +35,8 @@ from screen_capture import (
     click_maximize_chart,
 )
 
-# Load environment variables
-load_dotenv()
+# Load environment variables from project dir (not only cwd), so e.g. GITHUB_TOKEN works for --trades --sync-github.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # Total initial capital (USD) for backtests, buy-and-hold benchmark, and trade replay (all cash at t0).
 _raw_ic = os.getenv("INITIAL_CAPITAL_USD", "1000")
@@ -1263,6 +1263,9 @@ class DogecoinAnalyzer:
     # Non-negotiable hard stops that override any LLM recommendation.
 
     # Tunables (class-level constants; override via env if desired)
+    # Circuit breakers are off by default. Set CB_ENABLED=1 to enable (drawdown, inventory cap, extreme vol, ADX downtrend).
+    _cb_env = (os.getenv("CB_ENABLED") or "0").strip().lower()
+    CB_ENABLED = _cb_env not in ("0", "false", "no", "off")
     CB_DAILY_DRAWDOWN_PCT = float(os.getenv("CB_DAILY_DRAWDOWN_PCT", "4.0"))   # max 24h portfolio drop before sleep
     CB_SLEEP_HOURS        = float(os.getenv("CB_SLEEP_HOURS", "48"))            # how long to sleep after drawdown trip
     CB_INVENTORY_MAX_PCT  = float(os.getenv("CB_INVENTORY_MAX_PCT", "50"))      # max % of portfolio in DOGE
@@ -1277,6 +1280,8 @@ class DogecoinAnalyzer:
         Returns a list of (tag, message) for every tripped breaker.
         An empty list means "all clear — proceed to LLM."
         """
+        if not self.CB_ENABLED:
+            return []
         tripped = []
         inv = chart_data.get("investment_status") or {}
         alloc = inv.get("current_allocation") or {}
@@ -4508,10 +4513,11 @@ def _replay_avg_cost_basis_per_trade(rows_asc):
 
 
 def _parse_trades_cli(argv):
-    """Parse argv after `--trades`: [limit] [--local|--remote] [--db PATH]."""
+    """Parse argv after `--trades`: [limit] [--local|--remote] [--db PATH] [--sync-github]."""
     limit = 30
     mode = "auto"  # auto: REMOTE_TRADING_DATA_DB if set, else local default
     db_explicit = None
+    sync_github = False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -4520,6 +4526,9 @@ def _parse_trades_cli(argv):
             i += 1
         elif a == "--local":
             mode = "local"
+            i += 1
+        elif a == "--sync-github":
+            sync_github = True
             i += 1
         elif a == "--db" and i + 1 < len(argv):
             db_explicit = argv[i + 1]
@@ -4530,7 +4539,132 @@ def _parse_trades_cli(argv):
             except ValueError:
                 print(f"⚠️  Unknown --trades argument ignored: {a}")
             i += 1
-    return limit, mode, db_explicit
+    return limit, mode, db_explicit, sync_github
+
+
+def _infer_github_repo() -> Optional[str]:
+    """Return 'owner/repo' for this project (GitHub Actions or git remote)."""
+    r = (os.getenv("GITHUB_TRADES_REPO") or os.getenv("GITHUB_REPOSITORY") or "").strip()
+    if r and "/" in r:
+        return r
+    try:
+        import subprocess
+        import re
+        root = Path(__file__).resolve().parent
+        url = subprocess.check_output(
+            ["git", "-C", str(root), "config", "--get", "remote.origin.url"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        m = re.search(r"github\.com[:/]([^/]+)/([^/.]+)", url)
+        if m:
+            return f"{m.group(1)}/{m.group(2)}"
+    except Exception:
+        pass
+    return None
+
+
+def _download_ci_trading_db() -> Optional[str]:
+    """
+    Download the latest Actions artifact named `trading_data_db` (zip) and extract trading_data.db.
+    Requires GITHUB_TOKEN or GH_TOKEN with **actions:read** (fine-grained) or **repo** scope (classic PAT).
+    """
+    import io
+    import zipfile
+
+    token = (os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or "").strip()
+    if not token:
+        print(
+            "❌ --sync-github needs GITHUB_TOKEN or GH_TOKEN in the environment "
+            "(create a PAT with **actions:read** for this repo, or **repo** for a classic token)."
+        )
+        return None
+
+    repo = _infer_github_repo()
+    if not repo:
+        print(
+            "❌ Could not infer GitHub repo. Set GITHUB_TRADES_REPO=owner/repo "
+            "(or run from a clone whose origin is github.com/owner/repo)."
+        )
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url = f"https://api.github.com/repos/{repo}/actions/artifacts"
+    try:
+        r = requests.get(url, headers=headers, params={"per_page": 100}, timeout=60)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        print(f"❌ GitHub API error listing artifacts for `{repo}`: {e}")
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                body = resp.json()
+                if isinstance(body, dict) and body.get("message"):
+                    print(f"   GitHub: {body.get('message')}")
+            except Exception:
+                pass
+            code = resp.status_code
+            if code == 404:
+                print(
+                    "   **404 here usually means the token cannot read this repo** (GitHub hides private "
+                    "repos as “not found”). Use a **classic** PAT with the **repo** scope, or a **fine‑grained** "
+                    "PAT with this repository selected and **Actions → Read**. If the org uses SAML SSO, authorize "
+                    "the token for the org. You can also set **GITHUB_TRADES_REPO=owner/repo** if the DB lives "
+                    "in a different fork."
+                )
+            elif code == 401:
+                print("   **401**: token missing, revoked, or wrong type — check GITHUB_TOKEN in .env.")
+            elif code == 403:
+                print(
+                    "   **403**: token is valid but blocked — add **actions:read** / **repo**, or complete "
+                    "**SSO authorize** for the organization PAT."
+                )
+        return None
+
+    artifacts = [a for a in r.json().get("artifacts", []) if a.get("name") == "trading_data_db" and not a.get("expired")]
+    if not artifacts:
+        print(
+            "❌ No non-expired artifact named `trading_data_db` found. "
+            "Run the **DOGE MVP scheduled** workflow at least once (with upload-artifact step), then retry."
+        )
+        return None
+
+    artifacts.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    art = artifacts[0]
+    dl = art.get("archive_download_url")
+    if not dl:
+        print("❌ Artifact has no archive_download_url.")
+        return None
+
+    try:
+        rz = requests.get(dl, headers=headers, timeout=120, allow_redirects=True)
+        rz.raise_for_status()
+    except requests.RequestException as e:
+        print(f"❌ Download failed: {e}")
+        return None
+
+    dest = Path(__file__).resolve().parent / ".ci_trading_data.db"
+    try:
+        with zipfile.ZipFile(io.BytesIO(rz.content)) as zf:
+            names = zf.namelist()
+            db_members = [n for n in names if n.endswith("trading_data.db") or n.endswith("/trading_data.db")]
+            if not db_members:
+                print(f"❌ Zip has no trading_data.db (entries: {names[:10]}…)")
+                return None
+            member = db_members[0]
+            data = zf.read(member)
+        dest.write_bytes(data)
+    except (zipfile.BadZipFile, OSError, KeyError) as e:
+        print(f"❌ Could not extract database from artifact zip: {e}")
+        return None
+
+    print(f"✅ Downloaded CI database → {dest.resolve()}")
+    print("   Tip: export REMOTE_TRADING_DATA_DB=\"" + str(dest.resolve()) + "\" for default --trades source.")
+    return str(dest.resolve())
 
 
 def _resolve_trades_db_path(mode: str, db_explicit: Optional[str]) -> Optional[str]:
@@ -4643,8 +4777,14 @@ def main():
 
     # Trade list only needs SQLite — skip OpenAI/Coinbase init (supports CI DB via REMOTE_TRADING_DATA_DB).
     if len(sys.argv) > 1 and sys.argv[1] == "--trades":
-        limit, mode, db_explicit = _parse_trades_cli(sys.argv[2:])
-        resolved = _resolve_trades_db_path(mode, db_explicit)
+        limit, mode, db_explicit, sync_github = _parse_trades_cli(sys.argv[2:])
+        if sync_github:
+            ci_path = _download_ci_trading_db()
+            if not ci_path:
+                return
+            resolved = ci_path
+        else:
+            resolved = _resolve_trades_db_path(mode, db_explicit)
         show_previous_trades(limit=limit, db_path=resolved)
         return
     
@@ -4693,9 +4833,10 @@ def main():
                 print("  --review-reflections               : Review and add reflections to past trades")
                 print("  --generate-dataset [days] [format]: Generate training dataset (default: 7 days, sqlite)")
                 print("  --manual-trade <BUY|SELL> <pct>  : Manually execute a trade (e.g., --manual-trade SELL 20)")
-                print("  --trades [limit] [--local|--remote] [--db PATH]  : Show trades (default: local DB)")
-                print("      Uses REMOTE_TRADING_DATA_DB when set unless --local. --remote requires that env.")
-                print("      GitHub Actions: download artifact `trading_data_db`, set REMOTE_TRADING_DATA_DB to the .db path.")
+                print("  --trades [limit] [--local|--remote] [--db PATH] [--sync-github]  : Show trades from SQLite")
+                print("      Default: local trading_data.db; if REMOTE_TRADING_DATA_DB is set, use that path unless --local.")
+                print("      --sync-github: download latest `trading_data_db` artifact (needs GITHUB_TOKEN or GH_TOKEN).")
+                print("      Or manually download the artifact and use --db PATH / REMOTE_TRADING_DATA_DB.")
         else:
             # GitHub Actions: skip Selenium chart + SerpAPI news (unreliable / costly on CI runners).
             on_gha = (os.environ.get("GITHUB_ACTIONS", "").lower() == "true")
