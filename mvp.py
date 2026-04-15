@@ -858,8 +858,20 @@ class DogecoinAnalyzer:
                     technical_indicators['bb_lower'] = bb.bollinger_lband().iloc[-1]
                     technical_indicators['bb_width'] = bb.bollinger_wband().iloc[-1]
                     technical_indicators['bb_percent'] = bb.bollinger_pband().iloc[-1]
-                except:
-                    pass
+                    print(
+                        "🔧 Debug: Bollinger Bands OK "
+                        f"(clean rows={len(df_clean)}): "
+                        f"upper={technical_indicators['bb_upper']:.6f} "
+                        f"middle={technical_indicators['bb_middle']:.6f} "
+                        f"lower={technical_indicators['bb_lower']:.6f} "
+                        f"%B={technical_indicators['bb_percent']:.4f}"
+                    )
+                except Exception as e:
+                    print(f"⚠️  Debug: Bollinger Bands calculation failed (clean rows={len(df_clean)}): {e}")
+            else:
+                print(
+                    f"🔧 Debug: Bollinger Bands skipped — need ≥20 clean OHLCV rows after dropna, have {len(df_clean)}"
+                )
             
             # Average True Range (needs at least 14 periods)
             if len(df_clean) >= 14:
