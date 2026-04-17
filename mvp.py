@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import tempfile
 import requests
 import pandas as pd
@@ -22,6 +23,47 @@ import sqlite3
 
 # Import database module
 from database import TradingDatabase
+
+
+def _fmt_pct_or_na(val, decimals: int = 4) -> str:
+    """Format a percentage scalar for prompts; never emit NaN/inf as a bare number."""
+    if val is None or pd.isna(val):
+        return "N/A"
+    try:
+        fv = float(val)
+    except (TypeError, ValueError):
+        return "N/A"
+    if not math.isfinite(fv):
+        return "N/A"
+    return f"{fv:.{decimals}f}"
+
+
+def _trading_posture_aggressive() -> bool:
+    """Default aggressive; set TRADING_POSTURE=balanced|conservative|moderate to soften."""
+    v = (os.getenv("TRADING_POSTURE") or "aggressive").strip().lower()
+    return v not in ("balanced", "conservative", "moderate", "default")
+
+
+def _fee_gate_min_pct() -> float:
+    """Min |price−bb_middle|/bb_middle (%) treated as a fee edge target in prompts (not a hard code cap)."""
+    raw = os.getenv("FEE_GATE_MIN_PCT")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return 1.25 if _trading_posture_aggressive() else 2.5
+
+
+def _consecutive_buy_forbid_at() -> int:
+    """LLM prompt: forbid new BUY after this many consecutive successful BUYs (execution is not blocked here)."""
+    raw = os.getenv("CONSECUTIVE_BUY_FORBID_AFTER")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(2, int(raw))
+        except ValueError:
+            pass
+    return 6 if _trading_posture_aggressive() else 3
 
 # Import screen capture functionality
 from screen_capture import (
@@ -1021,13 +1063,36 @@ class DogecoinAnalyzer:
 
         # Bollinger Band Width % — regime filter (narrow = low-vol chop, wide = opportunity)
         bb_width_pct = None
-        if bb_upper is not None and bb_lower is not None and bb_middle is not None and bb_middle > 0:
-            bb_width_pct = round(((bb_upper - bb_lower) / bb_middle) * 100, 4)
+        if (
+            bb_upper is not None
+            and bb_lower is not None
+            and bb_middle is not None
+            and pd.notna(bb_upper)
+            and pd.notna(bb_lower)
+            and pd.notna(bb_middle)
+            and float(bb_middle) > 0
+        ):
+            raw_bw = (float(bb_upper) - float(bb_lower)) / float(bb_middle) * 100
+            if math.isfinite(raw_bw):
+                bb_width_pct = round(raw_bw, 4)
 
-        # Fee-edge %: |price − bb_middle| / bb_middle (must exceed ~2.5% to clear round-trip fees)
+        # Fee-edge %: |price − bb_middle| / bb_middle (prompt “gate” % comes from _fee_gate_min_pct / TRADING_POSTURE)
         fee_edge_pct = None
-        if bb_middle is not None and bb_middle > 0:
-            fee_edge_pct = round(abs(current_price - bb_middle) / bb_middle * 100, 4)
+        if (
+            bb_middle is not None
+            and pd.notna(bb_middle)
+            and float(bb_middle) > 0
+            and pd.notna(current_price)
+        ):
+            raw_fe = abs(float(current_price) - float(bb_middle)) / float(bb_middle) * 100
+            if math.isfinite(raw_fe):
+                fee_edge_pct = round(raw_fe, 4)
+
+        print(
+            "🔧 Debug: bargain metrics from 30d close + BB middle — "
+            f"bb_width_pct={bb_width_pct!r} fee_edge_pct={fee_edge_pct!r} "
+            f"(close={float(current_price):.6f})"
+        )
 
         comprehensive_data = {
             # 30-day chart data
@@ -1259,7 +1324,9 @@ class DogecoinAnalyzer:
                 buy_streak += 1
             else:
                 break
-        if buy_streak >= 3:
+        streak_forbid = _consecutive_buy_forbid_at()
+        streak_note_at = max(3, streak_forbid - 2)
+        if buy_streak >= streak_note_at:
             lines.append(
                 f"  • **Cadence note:** The **{buy_streak} newest** rows above are consecutive **BUY** — "
                 "if USD is already a tiny slice of the portfolio, that pattern usually **burns dry powder**; "
@@ -1379,8 +1446,10 @@ class DogecoinAnalyzer:
             if atr_pct <= 0:
                 return llm_pct
             # risk_pct of capital / atr_pct = max fraction of portfolio to risk
-            max_pct = (self.CB_ATR_RISK_PCT / atr_pct) * 100
-            capped = min(llm_pct, max(5.0, max_pct))
+            risk_mult = 1.65 if _trading_posture_aggressive() else 1.0
+            floor_pct = 8.0 if _trading_posture_aggressive() else 5.0
+            max_pct = (self.CB_ATR_RISK_PCT * risk_mult / atr_pct) * 100
+            capped = min(llm_pct, max(floor_pct, max_pct))
             return round(capped, 1)
         except Exception:
             return llm_pct
@@ -1482,6 +1551,10 @@ class DogecoinAnalyzer:
         
         trade_learning_block = self._format_trade_learning_context(limit=30)
         buy_streak = self._consecutive_buy_streak()
+        aggressive = _trading_posture_aggressive()
+        fee_gate_pct = _fee_gate_min_pct()
+        streak_forbid = _consecutive_buy_forbid_at()
+        fee_gate_frac = fee_gate_pct / 100.0
 
         dry_powder_block = ""
         inv = chart_data.get("investment_status") or {}
@@ -1495,9 +1568,16 @@ class DogecoinAnalyzer:
                 usd_cash_f = float(usd_cash) if usd_cash is not None else None
             except (TypeError, ValueError):
                 usd_pct_f = usd_cash_f = None
-            if usd_pct_f is not None and usd_pct_f < 15:
+            dry_threshold = 8.0 if aggressive else 15.0
+            if usd_pct_f is not None and usd_pct_f < dry_threshold:
                 cash_s = f"${usd_cash_f:.2f}" if usd_cash_f is not None else "low"
-                dry_powder_block = f"""
+                if aggressive:
+                    dry_powder_block = f"""
+        **DRY POWDER NOTE (aggressive posture):**
+        - USD is **~{usd_pct_f:.1f}%** of portfolio (**{cash_s}** cash). Notional per BUY is smaller — **size down** (e.g. 10–18%) but you may still BUY on high-conviction dips; prefer **SELL** only when trimming obvious overextension.
+"""
+                else:
+                    dry_powder_block = f"""
         **DRY POWDER WARNING:**
         - USD is only **~{usd_pct_f:.1f}%** of portfolio (**{cash_s}** cash). Repeated BUYs shrink to tiny notional.
         - When dry powder is this tight: **SELL** to raise USD or **HOLD** — do not BUY by habit.
@@ -1517,12 +1597,20 @@ class DogecoinAnalyzer:
         **NEXT ~6H OPPORTUNITY BAND:** Hourly history too short for 6h-window stats this run.
 """
         else:
+            if aggressive:
+                tail = (
+                    "- **Aggressive posture:** you may still deploy **10–22%** tactical BUY/SELL when BB stretch, "
+                    "sentiment, or book skew gives **medium+** conviction — do not default to HOLD **only** because "
+                    "edge is inside this noise band."
+                )
+            else:
+                tail = "- Only trade when expected edge **clears** this noise band + fees; otherwise **HOLD**."
             short_horizon_block = f"""
         **NEXT ~6H OPPORTUNITY BAND (descriptive, not a target):**
         - Last ~6h move: **{_fmt_pct(sh.get('last_6h_close_return_pct'), signed=True)}**
         - Avg |6h move| (24h): **{_fmt_pct(sh.get('avg_abs_6h_return_pct_24h'))}**
         - Max up 6h: **{_fmt_pct(sh.get('max_up_6h_pct_24h'), signed=True)}**; max down 6h: **{_fmt_pct(sh.get('max_down_6h_pct_24h'), signed=True)}**
-        - Only trade when expected edge **clears** this noise band + fees; otherwise **HOLD**.
+        {tail}
 """
         
         # Prepare the prompt for ChatGPT
@@ -1532,9 +1620,9 @@ class DogecoinAnalyzer:
 
         # Governance: consecutive-buy streak + circuit breaker constraints
         streak_block = ""
-        if buy_streak >= 3:
+        if buy_streak >= streak_forbid:
             streak_block += f"""
-        **🚫 CONSECUTIVE-BUY CAP ACTIVE: {buy_streak} successful BUYs in a row without a SELL.**
+        **🚫 CONSECUTIVE-BUY CAP ACTIVE: {buy_streak} successful BUYs in a row without a SELL (cap={streak_forbid}).**
         You are FORBIDDEN from recommending BUY. Output HOLD or SELL only.
 """
         cb_constraints = chart_data.get("_circuit_breaker_constraints") or []
@@ -1550,9 +1638,11 @@ class DogecoinAnalyzer:
         BUY is BLOCKED by the circuit breaker. Output HOLD or SELL only.
 """
 
+        posture_tag = "TRADING_POSTURE=aggressive" if aggressive else "TRADING_POSTURE=balanced"
         prompt = f"""
         Analyze DOGE for the next ~6-hour automated trading cycle. Apply the Bargain Hunter mean-reversion strategy from your system prompt.{chart_image_note}
 
+        **POSTURE:** {posture_tag} (override with env `TRADING_POSTURE` + optional `FEE_GATE_MIN_PCT`, `CONSECUTIVE_BUY_FORBID_AFTER`).
         **EXECUTION CADENCE:** Bot runs every ~6 hours (cron). No intraday monitoring between runs.
 {streak_block}
         📊 MARKET DATA:
@@ -1572,21 +1662,23 @@ class DogecoinAnalyzer:
         - BB Middle: ${chart_data['technical_indicators_30d'].get('bb_middle', 'N/A')}
         - BB Lower: ${chart_data['technical_indicators_30d'].get('bb_lower', 'N/A')}
         - BB %B: {chart_data['technical_indicators_30d'].get('bb_percent', 'N/A')}
-        - **BB Width %: {chart_data.get('bb_width_pct', 'N/A')}%** (narrow < 5% = low-vol chop; wide > 10% = opportunity)
-        - **Fee-edge %: {chart_data.get('fee_edge_pct', 'N/A')}%** (|price − bb_middle| / bb_middle; must be > 2.5% to clear round-trip fees)
+        - **BB Width %: {_fmt_pct_or_na(chart_data.get('bb_width_pct'))}%** (narrow < 5% = low-vol chop; wide > 10% = opportunity)
+        - **Fee-edge %: {_fmt_pct_or_na(chart_data.get('fee_edge_pct'))}%** (|price − bb_middle| / bb_middle; **target** ≥ **{fee_gate_pct:.2f}%** for “full size” — see system prompt; aggressive posture allows smaller tactical BUYs below that when conviction is strong)
         - RSI: {chart_data['technical_indicators_30d'].get('rsi', 'N/A')}
         - MACD: {chart_data['technical_indicators_30d'].get('macd', 'N/A')}  |  Signal: {chart_data['technical_indicators_30d'].get('macd_signal', 'N/A')}
         - ATR: {chart_data['technical_indicators_30d'].get('atr', 'N/A')}
         - ADX: {chart_data['technical_indicators_30d'].get('adx', 'N/A')} (+DI: {chart_data['technical_indicators_30d'].get('adx_pos', 'N/A')}, -DI: {chart_data['technical_indicators_30d'].get('adx_neg', 'N/A')})
+        - DATA CONSISTENCY RULE: If BB Upper/Middle/Lower are numeric above, treat Bollinger as available. Do NOT claim BB is unavailable/missing.
+        - If Fee-edge % is a number above, treat it as computed and available. Do NOT claim fee-edge is missing/unavailable/N/A.
 
         **BARGAIN-HUNTER SIZING METRICS:**
-        - **dist_to_support_pct: {chart_data.get('dist_to_support_pct', 'N/A')}%** (distance from current price to 30d low; < 2% = aggressive size, 2-5% = moderate, > 5% = small/HOLD)
+        - **dist_to_support_pct: {chart_data.get('dist_to_support_pct', 'N/A')}%** (distance from current price to 30d low; < 2% = largest size, 2–5% = moderate, > 5% = **still allow** 15–25% BUY in aggressive posture if Fear&Greed is very fearful and price is not extended vs upper band; otherwise size down)
 
         **CURRENT POSITION:**
         - Portfolio: ${chart_data['investment_status'].get('portfolio_value', 'N/A')}
         - USD: ${(chart_data['investment_status'].get('current_balances', dict()).get('usd') or 0):.2f} ({chart_data['investment_status'].get('current_allocation', dict()).get('usd_percentage', 'N/A')}%)
         - DOGE (USD): ${(chart_data['investment_status'].get('current_balances', dict()).get('doge_value_usd') or 0):.2f} ({chart_data['investment_status'].get('current_allocation', dict()).get('doge_percentage', 'N/A')}%)
-        - Consecutive successful BUYs (newest): **{buy_streak}** (if >= 3: BUY is FORBIDDEN — see system prompt rule 6)
+        - Consecutive successful BUYs (newest): **{buy_streak}** (if >= **{streak_forbid}**: BUY is FORBIDDEN — see system prompt rule 6)
 
         **SENTIMENT:**
         - Fear & Greed: {chart_data['fear_greed_index'].get('current', dict()).get('value', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'} ({chart_data['fear_greed_index'].get('current', dict()).get('classification', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'})
@@ -1596,7 +1688,7 @@ class DogecoinAnalyzer:
         **OUTPUT JSON (strict format):**
         {{
             "recommendation": "BUY|SELL|HOLD",
-            "percentage": <10-30 or null if HOLD>,
+            "percentage": <15-35 (aggressive) / 10-30 (balanced) or null if HOLD>,
             "invalidation_price": <price where thesis is wrong, null if HOLD/SELL>,
             "confidence_level": "High|Medium|Low",
             "reasoning": "<1-3 sentences: which Bargain Hunter rule triggered, fee-edge check, regime, dist_to_support sizing>",
@@ -1607,9 +1699,9 @@ class DogecoinAnalyzer:
         }}
 
         **SIZE RULES:**
-        - BUY: 10-30% of USD based on dist_to_support (see system prompt rule 9). Never 100%.
-        - SELL: 20-30% of DOGE when price hits BB Middle or above. Take the snap-back, don't wait for the moon.
-        - HOLD: percentage = null. Default when price is in "No Man's Land" (middle of BB) or fee-edge < 2.5%.
+        - BUY: **15–35%** of USD in aggressive posture when signals align; otherwise 10–30%. Never 100%.
+        - SELL: 20-35% of DOGE when price hits BB Middle or above (or overbought stretch). Take the snap-back, don't wait for the moon.
+        - HOLD: percentage = null. Use **sparingly** in aggressive posture — only when churn is extreme (very narrow BB **and** fee-edge far under **{fee_gate_pct:.2f}%**) **and** no supportive sentiment/book skew.
         - If USD < $20: BUY is infeasible — HOLD or SELL only.
 
         Return ONLY valid JSON, no text before or after.
@@ -1617,38 +1709,52 @@ class DogecoinAnalyzer:
         
         try:
             client = openai.OpenAI(api_key=self.openai_api_key)
-            
-            # Prepare messages with image if available
-            messages = [
-                {
-                    "role": "system",
-                    "content": """You are an AGGRESSIVE DOGE BARGAIN HUNTER. Your edge is MEAN REVERSION with strict governance.
 
-STRATEGIC MANDATE (follow in order):
+            tiny_fee = max(0.15, fee_gate_pct * 0.35)
+            if aggressive:
+                mandate_mid = f"""
+3. NO MAN'S LAND — When price trades between Bollinger bands without an obvious rubber-band **stretch**:
+   - **Do not automatically HOLD.** Lean **BUY 15–28%** when Fear & Greed < 30 and at least one of: RSI < 42, price below BB middle, or bid-heavy book skew. Lean **SELL** when price hugs the upper band or asks dominate.
+   - Reserve pure HOLD for extreme chop: **very** narrow BB width **and** fee-edge far under **{tiny_fee:.2f}%** **and** sentiment not fearful.
 
-1. THE BUY EDGE — Only BUY when DOGE is "stretched" to the downside:
-   - Price near or below the Lower Bollinger Band AND RSI < 35 = strong BUY zone.
-   - Fear & Greed Index < 30 (extreme fear) adds conviction — contrarian entry.
-   - The closer price sits to 30-day Support, the more aggressive the size (structurally cheap = tight invalidation).
+4. FEE GATE — Treat **{fee_gate_pct:.2f}%** (|price−bb_middle|/bb_middle) as a **full-size** target, **not** a hard ban.
+   - If fee-edge ≥ **{fee_gate_pct:.2f}%**: you may use **25–35%** BUY when the rubber-band thesis is intact.
+   - If fee-edge is **below** **{fee_gate_pct:.2f}%** but ≥ **{tiny_fee:.2f}%**: still allow **12–24%** tactical BUY when **two** of: Fear&Greed<30, RSI<42, negative 6h drift, bid skew.
+   - **HOLD** only if fee-edge < **{tiny_fee:.2f}%** **and** no tactical confirmations.
 
-2. THE SELL EDGE — SELL (take profit) when price snaps back toward the Mean:
-   - Price returns to or exceeds the Bollinger Middle Band (20-day SMA) = take-profit zone.
-   - Price near or above Upper Bollinger Band = aggressive SELL (overbought rubber-band).
-   - Do NOT "wait for the moon" — capture the 3-5% mean-reversion snap-back and exit.
+5. CRASH GUARD — If 24h price change is worse than **-10%**:
+   - Cut BUY size by **~25%** (not half) vs what you would otherwise do — still participate if the band stretch is real.
 
+6. CONSECUTIVE-BUY CAP — The user prompt shows the streak.
+   - If streak ≥ **{streak_forbid}**, you MUST output HOLD (or SELL). FORBIDDEN: another BUY until a SELL clears the streak.
+
+7. INVALIDATION PRICE — Every BUY must include `invalidation_price`.
+   - In aggressive posture, **pick a practical level** (e.g. just under recent micro-support or the lower band) instead of punting to HOLD when the chart is messy.
+
+8. REGIME AWARENESS:
+   - Low volatility: **still allow** 10–20% tactical BUY on contrarian fear; low 24h vol is **not** an automatic HOLD.
+   - High volatility: use the **upper** end of allowed % ranges when BB stretch + trend alignment support it.
+
+9. SIZE — push conviction into size (subject to streak cap + code clamps):
+   - dist_to_support < 2% → **28–35%** BUY when signals align.
+   - 2–5% → **20–30%** BUY.
+   - >5% → **15–26%** BUY when Fear&Greed is very fearful; else **12–18%** BUY or rotate to SELL if overextended long.
+"""
+            else:
+                mandate_mid = f"""
 3. NO MAN'S LAND — When price is in the middle of the Bollinger Bands with no clear stretch:
    - Default to HOLD. Trading the middle is paying fees for noise.
    - Exception: if dry powder is nearly gone (USD < 10% of portfolio), a small SELL to rebuild cash is permitted for tactical optionality.
 
-4. FEE GATE — Do NOT recommend a trade unless the distance between Current Price and the Bollinger Middle Band is at least 2.5%.
-   If |price - bb_middle| / bb_middle < 0.025, the potential gain does not clear Coinbase round-trip fees + slippage. Force HOLD.
+4. FEE GATE — Do NOT recommend a trade unless |price − bb_middle| / bb_middle is at least **{fee_gate_pct:.2f}%** (~{fee_gate_frac:.4f} as a fraction).
+   If below that, the potential gain may not clear Coinbase round-trip fees + slippage — default HOLD unless BB stretch is obvious.
 
 5. CRASH GUARD — If 24h Price Change is worse than -10% (a crash / falling knife):
    - Reduce any BUY size by at least 50% vs what you would normally suggest.
    - A crash may keep crashing; preserve capital for a second, cheaper entry next cycle.
 
 6. CONSECUTIVE-BUY CAP — The user prompt will tell you the current consecutive-BUY streak.
-   If that streak is >= 3, you MUST output HOLD (or SELL if the chart warrants it). You are FORBIDDEN from recommending another BUY until a SELL clears the streak.
+   If that streak is >= **{streak_forbid}**, you MUST output HOLD (or SELL if the chart warrants it). You are FORBIDDEN from recommending another BUY until a SELL clears the streak.
    This prevents averaging down into a structural collapse.
 
 7. INVALIDATION PRICE — Every BUY recommendation MUST include an "invalidation_price" in the JSON: the price level where the trade thesis is wrong.
@@ -1663,6 +1769,23 @@ STRATEGIC MANDATE (follow in order):
    - dist_to_support < 2% = aggressive size (25-30%); tight stop means limited downside.
    - dist_to_support 2-5% = moderate size (15-20%).
    - dist_to_support > 5% = small size (10-15%) or HOLD.
+"""
+
+            system_content = f"""You are an AGGRESSIVE DOGE BARGAIN HUNTER. Your edge is MEAN REVERSION — **size up** when the tape gives you skew + stretch; governance still applies.
+
+STRATEGIC MANDATE (follow in order):
+
+1. THE BUY EDGE — BUY when DOGE is **cheap or stretched** vs the local mean:
+   - Price near/below Lower Bollinger **or** RSI < 40 with supportive book = **BUY zone** (not only RSI<35).
+   - Fear & Greed < 30 adds conviction — use it to **justify** buys even when the candle isn't perfect.
+   - Closer to 30d support → **larger** size (still respect streak cap + code clamps).
+
+2. THE SELL EDGE — SELL (take profit) when price snaps back toward the mean:
+   - Price returns to or exceeds the Bollinger Middle Band (20-day SMA) = take-profit zone.
+   - Price near or above Upper Bollinger Band = aggressive SELL (overbought rubber-band).
+   - Do NOT "wait for the moon" — capture the 3-5% mean-reversion snap-back and exit.
+
+{mandate_mid}
 
 10. CHART IS PRIMARY — Read price action, candlestick patterns, support/resistance, Bollinger Bands from the chart image.
     Technical indicators (RSI, MACD, etc.) are secondary confirmation. News is tertiary (DOGE news is mostly noise).
@@ -1673,7 +1796,13 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
 - If 24h Volatility exceeds the extreme threshold or a daily drawdown breaker fires, you will not even be called — the system will force HOLD.
 - Your suggested percentage will be automatically clamped by a volatility-weighted (ATR-based) position sizer. Suggest your ideal %, and the system will cap it.
 - ADX data is provided. If ADX > 35 with -DI > +DI, a strong downtrend is in effect — the system blocks BUY. Respect this in your reasoning.
-""",
+"""
+
+            # Prepare messages with image if available
+            messages = [
+                {
+                    "role": "system",
+                    "content": system_content,
                 },
                 {
                     "role": "user",
@@ -1751,7 +1880,7 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
                 model="gpt-4o",
                 messages=messages,
                 max_tokens=10000,  # Increased for structured JSON output
-                temperature=0.3,  # Lower temperature for more consistent results
+                temperature=(0.55 if aggressive else 0.3),
                 response_format={"type": "json_object"}  # Force JSON output, schema validated manually
             )
             
@@ -1764,6 +1893,9 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
                 validation_error = self.validate_json_schema(analysis_json, json_schema)
                 if validation_error:
                     raise ValueError(f"JSON Schema validation failed: {validation_error}")
+
+                # Sanity-correct contradictory wording (e.g., "Bollinger unavailable" when BB values exist).
+                analysis_json = self._sanitize_indicator_reasoning_consistency(analysis_json, chart_data)
                 
                 # Format the JSON response as a readable text analysis
                 formatted_analysis = self.format_json_analysis(analysis_json)
@@ -1850,6 +1982,78 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
         if errors:
             return "; ".join(errors)
         return None
+
+    def _sanitize_indicator_reasoning_consistency(self, analysis_json, chart_data):
+        """
+        Fix obvious contradictions in model text against provided indicator payload.
+        Guards against "Bollinger unavailable/missing" claims when BB values are present.
+        """
+        if not isinstance(analysis_json, dict):
+            return analysis_json
+
+        ti = (chart_data or {}).get("technical_indicators_30d") or {}
+        bb_upper = ti.get("bb_upper")
+        bb_middle = ti.get("bb_middle")
+        bb_lower = ti.get("bb_lower")
+        bb_available = all(v is not None and pd.notna(v) for v in (bb_upper, bb_middle, bb_lower))
+
+        fep = (chart_data or {}).get("fee_edge_pct")
+        fee_edge_available = False
+        fee_edge_val = None
+        if fep is not None and pd.notna(fep):
+            try:
+                fv = float(fep)
+                if math.isfinite(fv):
+                    fee_edge_available = True
+                    fee_edge_val = fv
+            except (TypeError, ValueError):
+                pass
+
+        def _fix_bb(text):
+            if not bb_available or not isinstance(text, str):
+                return text
+            lower = text.lower()
+            mentions_bb = ("bollinger" in lower) or ("bb " in lower)
+            says_missing = (
+                ("unavailable" in lower)
+                or ("not available" in lower)
+                or ("missing" in lower)
+                or ("not provided" in lower)
+            )
+            if mentions_bb and says_missing:
+                return (
+                    f"Bollinger Bands are available (upper={float(bb_upper):.6f}, "
+                    f"middle={float(bb_middle):.6f}, lower={float(bb_lower):.6f}). "
+                    "Use BB position together with fee-edge and regime filters for the decision."
+                )
+            return text
+
+        def _fix_fee(text):
+            if not fee_edge_available or not isinstance(text, str):
+                return text
+            lower = text.lower()
+            mentions_fee = ("fee-edge" in lower) or ("fee edge" in lower) or ("feeedge" in lower)
+            says_missing = (
+                ("unavailable" in lower)
+                or ("not available" in lower)
+                or ("missing" in lower)
+                or ("not provided" in lower)
+                or ("nan" in lower)
+            )
+            if mentions_fee and says_missing:
+                return (
+                    f"Fee-edge is {fee_edge_val:.4f}% (|price−bb_middle|/bb_middle). "
+                    f"Compare to the configured fee gate (~{_fee_gate_min_pct():.2f}%) and BB stretch before HOLD."
+                )
+            return text
+
+        def _fix_text(text):
+            return _fix_fee(_fix_bb(text))
+
+        analysis_json["reasoning"] = _fix_text(analysis_json.get("reasoning"))
+        if isinstance(analysis_json.get("key_market_factors"), list):
+            analysis_json["key_market_factors"] = [_fix_text(v) for v in analysis_json["key_market_factors"]]
+        return analysis_json
     
     def _validate_type(self, value, expected_type):
         """Check if value matches expected type."""
@@ -4727,7 +4931,30 @@ def show_previous_trades(limit=30, db_path: Optional[str] = None):
     print(f"📂 Trade history database: {Path(db.db_path).resolve()}")
     trades = db.get_recent_trades(limit=limit)
     if not trades:
-        print("No previous transactions found.")
+        analyses = db.get_recent_analyses(limit=limit)
+        if not analyses:
+            print("No previous transactions found.")
+            return
+        print("No executed BUY/SELL transactions found.")
+        print()
+        print("=" * 104)
+        print("  RECENT AI DECISIONS (including HOLD)")
+        print("=" * 104)
+        print(f"  {'Date':<22} {'Decision':<10} {'Pct':<8} {'Confidence':<10}  Reasoning")
+        print("  " + "-" * 112)
+        for row in analyses:
+            ts = row["timestamp"][:19].replace("T", " ") if row["timestamp"] else ""
+            rec = (row["recommendation"] or "N/A").upper()
+            pct = row["percentage"]
+            pct_s = f"{float(pct):.0f}%" if pct is not None else "—"
+            conf = (row["confidence_level"] or "N/A")
+            reason = (row["reasoning"] or "").replace("\n", " ").strip()
+            if len(reason) > 68:
+                reason = reason[:65] + "..."
+            print(f"  {ts:<22} {rec:<10} {pct_s:<8} {conf:<10}  {reason}")
+        print("=" * 104)
+        print(f"  Showing {len(analyses)} most recent decision(s) from analysis_results")
+        print()
         return
     print()
     print("=" * 104)
