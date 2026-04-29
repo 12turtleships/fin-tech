@@ -49,6 +49,11 @@ Trading behavior controls:
 - `CONSECUTIVE_BUY_FORBID_AFTER` - optional BUY streak cap override in prompt
 - `CB_ENABLED` - defaults to `0` (set `1` to enable circuit breakers)
 
+Aggressive posture is two-way:
+
+- Buys dips aggressively when fear/mean-reversion signals align.
+- Sells rips aggressively near resistance/upper-band conditions.
+
 ## Quick Start
 
 Run a full analysis cycle:
@@ -68,6 +73,10 @@ python mvp.py --simulate-and-dataset 7 sqlite
 python mvp.py --manual-trade SELL 20
 python mvp.py --trades 50
 python mvp.py --trades 50 --sync-github
+python check_balance.py
+python check_balance.py --ci
+python check_balance.py --db /path/to/trading_data.db
+python reconcile_balances.py --ci
 ```
 
 ## Trade History and CI Database Sync
@@ -85,6 +94,22 @@ After sync, you can default `--trades` to the downloaded file:
 ```bash
 export REMOTE_TRADING_DATA_DB="/Users/sungchun/projects/fin-tech/.ci_trading_data.db"
 ```
+
+## Balance and Snapshot Reconciliation
+
+There are multiple balance views in this repo:
+
+- `check_balance.py` always shows a **live Coinbase balance block** at the top.
+- Its DB-based performance section can target local DB (default), CI DB (`--ci`), or explicit DB (`--db /path/to/file.db`).
+- `mvp.py --trades` shows historical trade rows from selected SQLite DB, not live balances.
+
+Compare live account state vs latest DB snapshot:
+
+```bash
+python reconcile_balances.py --ci
+```
+
+This prints live USD/DOGE, latest snapshot balances, deltas, and inferred missing trade leg when there is a gap.
 
 ## GitHub Actions Schedule
 
@@ -127,3 +152,4 @@ SQLite DB (default `trading_data.db`) tables include:
 - This is high-risk software for educational/experimental use.
 - Validate behavior in simulation before enabling real execution.
 - Keep API keys and tokens out of version control.
+- If `INITIAL_CAPITAL_USD=1`, YTD/all-time percentages can look huge; set realistic basis values for meaningful reporting.

@@ -10,11 +10,14 @@ External fiat (ACH/card transfers) is not in the bot's trade table. This script:
 """
 
 import os
+import argparse
+from pathlib import Path
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from trade_executor import CoinbaseTradeExecutor
 from mvp import DogecoinAnalyzer, INITIAL_CAPITAL_USD
+from database import TradingDatabase
 
 # Defensive: mvp clamps, but avoid div-by-zero if this module is imported in isolation.
 INITIAL_PORTFOLIO_VALUE = float(INITIAL_CAPITAL_USD) if float(INITIAL_CAPITAL_USD) > 0 else 1000.0
@@ -158,6 +161,19 @@ def infer_external_usd_deposits(trades, abs_tol=5.0):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Show live balances and DB-based performance.")
+    parser.add_argument(
+        "--ci",
+        action="store_true",
+        help="Use .ci_trading_data.db instead of local trading_data.db for DB-based sections.",
+    )
+    parser.add_argument(
+        "--db",
+        default=None,
+        help="Explicit SQLite DB path to use for DB-based sections.",
+    )
+    args = parser.parse_args()
+
     load_dotenv()
     if not os.getenv("COINBASE_API_KEY") or not (os.getenv("COINBASE_PRIVATE_KEY") or os.getenv("COINBASE_API_SECRET")):
         print("❌ Missing Coinbase API credentials in .env (COINBASE_API_KEY and COINBASE_PRIVATE_KEY or COINBASE_API_SECRET)")
@@ -221,6 +237,27 @@ def main():
     except Exception as e:
         print(f"⚠️  Could not initialize analyzer for performance: {e}")
         return
+
+    # Override DB source when requested (default behavior remains local trading_data.db).
+    db_override = None
+    if args.db:
+        db_override = str(Path(args.db).expanduser().resolve())
+    elif args.ci:
+        db_override = str((Path(__file__).resolve().parent / ".ci_trading_data.db").resolve())
+
+    if db_override:
+        try:
+            # Close default DB opened by analyzer, then switch to the requested one.
+            if analyzer.db:
+                try:
+                    analyzer.db.close()
+                except Exception:
+                    pass
+            analyzer.db = TradingDatabase(db_override)
+            analyzer.database_enabled = True
+        except Exception as e:
+            print(f"⚠️  Could not switch database to {db_override}: {e}")
+            return
 
     if not analyzer.database_enabled or not analyzer.db:
         print("⚠️  Database not enabled - cannot compute period performance.")
