@@ -1054,9 +1054,10 @@ class DogecoinAnalyzer:
         technical_indicators_24h = self.calculate_technical_indicators(df_24h) if df_24h is not None else {}
 
         # --- Bargain-hunter derived metrics ---
-        bb_upper = technical_indicators_30d.get('bb_upper')
-        bb_lower = technical_indicators_30d.get('bb_lower')
-        bb_middle = technical_indicators_30d.get('bb_middle')
+        # Prefer 30d BB values; fall back to 24h when 30d data has too few clean rows
+        bb_upper  = technical_indicators_30d.get('bb_upper')  or technical_indicators_24h.get('bb_upper')
+        bb_lower  = technical_indicators_30d.get('bb_lower')  or technical_indicators_24h.get('bb_lower')
+        bb_middle = technical_indicators_30d.get('bb_middle') or technical_indicators_24h.get('bb_middle')
 
         # Distance to 30-day support (recent low): how structurally cheap the entry is
         dist_to_support_pct = round(((current_price - recent_low) / recent_low) * 100, 2) if recent_low and recent_low > 0 else None
