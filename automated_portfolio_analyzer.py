@@ -22,7 +22,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('/Users/sungchun/projects/fin-tech/portfolio_analyzer.log'),
+        logging.FileHandler(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'portfolio_analyzer.log')),
         logging.StreamHandler()
     ]
 )
@@ -32,9 +32,9 @@ logger = logging.getLogger(__name__)
 EMAIL_CONFIG = {
     'smtp_server': 'smtp.gmail.com',
     'smtp_port': 587,
-    'sender_email': 'sungchun71@gmail.com',
-    'sender_password': os.getenv('EMAIL_PASSWORD'),  # Set this as environment variable
-    'recipient_email': 'sungchun71@gmail.com'
+    'sender_email': os.getenv('SENDER_EMAIL'),
+    'sender_password': os.getenv('EMAIL_PASSWORD'),
+    'recipient_email': os.getenv('RECIPIENT_EMAIL')
 }
 
 def should_sell_stock(data, threshold_percent=5.0, consecutive_days=1):
@@ -274,10 +274,11 @@ def analyze_portfolio():
     
     try:
         # Read stock lists
-        with open('/Users/sungchun/projects/fin-tech/bought-list.txt', 'r') as f:
+        _base = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(_base, 'bought-list.txt'), 'r') as f:
             bought_list = [line.strip().upper() for line in f.readlines() if line.strip()]
-        
-        with open('/Users/sungchun/projects/fin-tech/interest-list.txt', 'r') as f:
+
+        with open(os.path.join(_base, 'interest-list.txt'), 'r') as f:
             interest_list = [line.strip().upper() for line in f.readlines() if line.strip()]
         
         logger.info(f"Loaded {len(bought_list)} bought stocks and {len(interest_list)} interest stocks")

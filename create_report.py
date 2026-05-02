@@ -4,7 +4,7 @@ import openpyxl
 from datetime import datetime
 
 # Read the existing Excel file with the correct sheet name (lowercase)
-file_path = "/Users/sungchun/Downloads/4D_Leadership_List (1).xlsx"
+file_path = "/path/to/4D_Leadership_List.xlsx"
 df = pd.read_excel(file_path, sheet_name="Group Leaders")
 
 # Convert appointment date to datetime

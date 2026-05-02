@@ -6,7 +6,7 @@ This system automatically analyzes your portfolio every hour during market hours
 
 ### 1. Run the Setup Script
 ```bash
-cd /Users/sungchun/projects/fin-tech
+cd ~/projects/fin-tech
 ./setup_automation.sh
 ```
 
@@ -37,14 +37,13 @@ The setup script will:
 crontab -e
 
 # Add this line:
-0 9-15 * * 1-5 cd /Users/sungchun/projects/fin-tech && python automated_portfolio_analyzer.py >> /Users/sungchun/projects/fin-tech/cron.log 2>&1
+0 9-15 * * 1-5 cd ~/projects/fin-tech && python automated_portfolio_analyzer.py >> ~/projects/fin-tech/cron.log 2>&1
 ```
 
 ## 📁 Files Created
 
 - `automated_portfolio_analyzer.py` - Main automation script
 - `setup_automation.sh` - Setup script
-- `test_email.py` - Email testing script
 - `portfolio_analyzer.log` - Analysis logs
 - `cron.log` - Cron execution logs
 
@@ -63,7 +62,7 @@ crontab -e
 ### Email Notifications
 - **Trigger:** Only when buy/sell recommendations are found
 - **Content:** Detailed analysis with current prices and recommendations
-- **Recipient:** sungchun71@gmail.com
+- **Recipient:** configured via `RECIPIENT_EMAIL` environment variable
 
 ## 📊 Monitoring
 
@@ -79,11 +78,6 @@ tail -f cron.log
 crontab -l
 ```
 
-### Test Email
-```bash
-python test_email.py
-```
-
 ### Manual Run
 ```bash
 python automated_portfolio_analyzer.py
@@ -94,9 +88,8 @@ python automated_portfolio_analyzer.py
 ### Common Issues
 
 1. **Email not sending:**
-   - Check EMAIL_PASSWORD environment variable
+   - Check `SENDER_EMAIL`, `RECIPIENT_EMAIL`, `EMAIL_PASSWORD` environment variables
    - Verify Gmail App Password is correct
-   - Test with: `python test_email.py`
 
 2. **Cron job not running:**
    - Check crontab: `crontab -l`
@@ -109,8 +102,8 @@ python automated_portfolio_analyzer.py
    - Test manual run: `python automated_portfolio_analyzer.py`
 
 ### Log Locations
-- Analysis logs: `/Users/sungchun/projects/fin-tech/portfolio_analyzer.log`
-- Cron logs: `/Users/sungchun/projects/fin-tech/cron.log`
+- Analysis logs: `~/projects/fin-tech/portfolio_analyzer.log`
+- Cron logs: `~/projects/fin-tech/cron.log`
 
 ## 📈 Email Format
 

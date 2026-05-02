@@ -25,7 +25,7 @@ Dogecoin analysis and trading bot centered on `mvp.py`, with local/CI scheduling
 Install dependencies:
 
 ```bash
-cd /Users/sungchun/projects/fin-tech
+cd ~/projects/fin-tech
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -92,7 +92,7 @@ python mvp.py --trades 50 --sync-github
 After sync, you can default `--trades` to the downloaded file:
 
 ```bash
-export REMOTE_TRADING_DATA_DB="/Users/sungchun/projects/fin-tech/.ci_trading_data.db"
+export REMOTE_TRADING_DATA_DB="~/projects/fin-tech/.ci_trading_data.db"
 ```
 
 ## Balance and Snapshot Reconciliation
