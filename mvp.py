@@ -1054,9 +1054,10 @@ class DogecoinAnalyzer:
         technical_indicators_24h = self.calculate_technical_indicators(df_24h) if df_24h is not None else {}
 
         # --- Bargain-hunter derived metrics ---
-        bb_upper = technical_indicators_30d.get('bb_upper')
-        bb_lower = technical_indicators_30d.get('bb_lower')
-        bb_middle = technical_indicators_30d.get('bb_middle')
+        # Prefer 30d BB values; fall back to 24h when 30d data has too few clean rows
+        bb_upper  = technical_indicators_30d.get('bb_upper')  or technical_indicators_24h.get('bb_upper')
+        bb_lower  = technical_indicators_30d.get('bb_lower')  or technical_indicators_24h.get('bb_lower')
+        bb_middle = technical_indicators_30d.get('bb_middle') or technical_indicators_24h.get('bb_middle')
 
         # Distance to 30-day support (recent low): how structurally cheap the entry is
         dist_to_support_pct = round(((current_price - recent_low) / recent_low) * 100, 2) if recent_low and recent_low > 0 else None
@@ -1694,7 +1695,7 @@ class DogecoinAnalyzer:
         **OUTPUT JSON (strict format):**
         {{
             "recommendation": "BUY|SELL|HOLD",
-            "percentage": <15-35 (aggressive) / 10-30 (balanced) or null if HOLD>,
+            "percentage": <25-50 (aggressive) / 10-30 (balanced) or null if HOLD>,
             "invalidation_price": <price where thesis is wrong, null if HOLD/SELL>,
             "confidence_level": "High|Medium|Low",
             "reasoning": "<1-3 sentences: which Bargain Hunter rule triggered, fee-edge check, regime, dist_to_support sizing>",
@@ -1705,8 +1706,8 @@ class DogecoinAnalyzer:
         }}
 
         **SIZE RULES:**
-        - BUY: **15–35%** of USD in aggressive posture when signals align; otherwise 10–30%. Never 100%.
-        - SELL: **22-40%** of DOGE when price is near BB upper / 30d high, or when `dist_to_resistance_pct < 2%`; 20-30% for regular mean reversion.
+        - BUY: **25–50%** of USD in aggressive posture when signals align; otherwise 10–30%. Never 100%.
+        - SELL: **30-55%** of DOGE when price is near BB upper / 30d high, or when `dist_to_resistance_pct < 2%`; 25-40% for regular mean reversion.
         - HOLD: percentage = null. Use **sparingly** in aggressive posture — only when churn is extreme (very narrow BB **and** fee-edge far under **{fee_gate_pct:.2f}%**) **and** no supportive sentiment/book skew.
         - If USD < $20: BUY is infeasible — HOLD or SELL only.
 
@@ -1720,13 +1721,13 @@ class DogecoinAnalyzer:
             if aggressive:
                 mandate_mid = f"""
 3. NO MAN'S LAND — When price trades between Bollinger bands without an obvious rubber-band **stretch**:
-   - **Do not automatically HOLD.** Lean **BUY 15–28%** when Fear & Greed < 30 and at least one of: RSI < 42, price below BB middle, or bid-heavy book skew.
-   - Be aggressive on the upside too: lean **SELL 22–40%** when price hugs upper band, asks dominate, or `dist_to_resistance_pct < 2%` (near 30d high).
+   - **Do not automatically HOLD.** Lean **BUY 22–38%** when Fear & Greed < 30 and at least one of: RSI < 42, price below BB middle, or bid-heavy book skew.
+   - Be aggressive on the upside too: lean **SELL 30–55%** when price hugs upper band, asks dominate, or `dist_to_resistance_pct < 2%` (near 30d high).
    - Reserve pure HOLD for extreme chop: **very** narrow BB width **and** fee-edge far under **{tiny_fee:.2f}%** **and** sentiment not fearful.
 
 4. FEE GATE — Treat **{fee_gate_pct:.2f}%** (|price−bb_middle|/bb_middle) as a **full-size** target, **not** a hard ban.
-   - If fee-edge ≥ **{fee_gate_pct:.2f}%**: you may use **25–35%** BUY when the rubber-band thesis is intact.
-   - If fee-edge is **below** **{fee_gate_pct:.2f}%** but ≥ **{tiny_fee:.2f}%**: still allow **12–24%** tactical BUY when **two** of: Fear&Greed<30, RSI<42, negative 6h drift, bid skew.
+   - If fee-edge ≥ **{fee_gate_pct:.2f}%**: you may use **35–50%** BUY when the rubber-band thesis is intact.
+   - If fee-edge is **below** **{fee_gate_pct:.2f}%** but ≥ **{tiny_fee:.2f}%**: still allow **20–32%** tactical BUY when **two** of: Fear&Greed<30, RSI<42, negative 6h drift, bid skew.
    - **HOLD** only if fee-edge < **{tiny_fee:.2f}%** **and** no tactical confirmations.
 
 5. CRASH GUARD — If 24h price change is worse than **-10%**:
@@ -1743,8 +1744,8 @@ class DogecoinAnalyzer:
    - High volatility: use the **upper** end of allowed % ranges when BB stretch + trend alignment support it.
 
 9. SIZE — push conviction into size (subject to streak cap + code clamps):
-   - BUY side: dist_to_support < 2% → **28–35%** BUY; 2–5% → **20–30%** BUY; >5% → **15–26%** BUY only with strong fear/flow alignment.
-   - SELL side (equally aggressive): dist_to_resistance < 2% → **28–40%** SELL; 2–4% → **22–30%** SELL; if >4% but overbought BB/RSI divergence appears, use **18–25%** SELL tactical trims.
+   - BUY side: dist_to_support < 2% → **40–50%** BUY; 2–5% → **28–40%** BUY; >5% → **20–32%** BUY only with strong fear/flow alignment.
+   - SELL side (equally aggressive): dist_to_resistance < 2% → **40–55%** SELL; 2–4% → **30–42%** SELL; if >4% but overbought BB/RSI divergence appears, use **25–35%** SELL tactical trims.
 """
             else:
                 mandate_mid = f"""

@@ -27,6 +27,10 @@ jobs:
       COINBASE_PRIVATE_KEY: ${{ secrets.COINBASE_PRIVATE_KEY }}
       SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
       INITIAL_CAPITAL_USD: ${{ secrets.INITIAL_CAPITAL_USD }}
+      TRADING_POSTURE: aggressive
+      FEE_GATE_MIN_PCT: "0.75"
+      CB_ATR_RISK_PCT: "3.5"
+      CONSECUTIVE_BUY_FORBID_AFTER: "10"
 
     steps:
       - name: Checkout
