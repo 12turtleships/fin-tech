@@ -1531,9 +1531,129 @@ class DogecoinAnalyzer:
         - Use this **only as calibration** for the **next ~6h** decision: if you are about to repeat the same stance while last cycle’s **realized drift** hurt that stance, require **clearer** chart evidence this time.
 """
 
+    def _generate_strategy_insights(self, limit: int = 100) -> str:
+        """
+        Derive actionable strategy rules from labeled historical trades.
+
+        Pulls up to `limit` quality-labeled BUY/SELL rows (joined with market_data)
+        and buckets them by indicator conditions.  For each bucket it computes:
+          - win rate  (decision_correct == True)
+          - average quality score (-4 … +4)
+          - sample size
+
+        Returns a formatted text block ready to inject into the LLM prompt.
+        Buckets with < 3 samples are skipped (too noisy).
+        """
+        if not self.database_enabled or not self.db:
+            return ""
+        try:
+            rows = self.db.get_labeled_trades_with_indicators(limit=limit)
+        except Exception:
+            return ""
+        if not rows:
+            return ""
+
+        # ── helpers ────────────────────────────────────────────────────────
+        def _rsi_bucket(rsi):
+            if rsi is None: return None
+            r = float(rsi)
+            if r < 30:   return "RSI<30"
+            if r < 40:   return "RSI 30-40"
+            if r < 50:   return "RSI 40-50"
+            if r < 60:   return "RSI 50-60"
+            return "RSI>60"
+
+        def _fg_bucket(fg):
+            if fg is None: return None
+            v = int(fg)
+            if v < 25:  return "F&G<25 (Extreme Fear)"
+            if v < 45:  return "F&G 25-45 (Fear)"
+            if v < 60:  return "F&G 45-60 (Neutral)"
+            return "F&G>60 (Greed)"
+
+        def _bb_bucket(price, bb_upper, bb_middle, bb_lower):
+            if None in (price, bb_upper, bb_middle, bb_lower): return None
+            p, u, m, l = float(price), float(bb_upper), float(bb_middle), float(bb_lower)
+            if p <= l:        return "BB: at/below lower"
+            if p <= m:        return "BB: lower-to-mid"
+            if p <= u:        return "BB: mid-to-upper"
+            return "BB: at/above upper"
+
+        # ── accumulate bucket stats ─────────────────────────────────────────
+        # bucket_key → {wins, total, score_sum}
+        from collections import defaultdict
+        buy_buckets  = defaultdict(lambda: {"wins": 0, "total": 0, "score": 0.0})
+        sell_buckets = defaultdict(lambda: {"wins": 0, "total": 0, "score": 0.0})
+
+        for row in rows:
+            action = (row["action"] or "").upper()
+            if action not in ("BUY", "SELL"):
+                continue
+            correct = row["decision_correct"]
+            score   = row["decision_quality_score"] or 0
+            win     = 1 if correct else 0
+
+            rsi_b = _rsi_bucket(row["rsi"])
+            fg_b  = _fg_bucket(row["fear_greed_index"])
+            bb_b  = _bb_bucket(row["trade_price"], row["bb_upper"], row["bb_middle"], row["bb_lower"])
+
+            buckets = buy_buckets if action == "BUY" else sell_buckets
+            for key in (rsi_b, fg_b, bb_b):
+                if key is None:
+                    continue
+                buckets[key]["wins"]  += win
+                buckets[key]["total"] += 1
+                buckets[key]["score"] += score
+
+        # ── format one side (BUY or SELL) ──────────────────────────────────
+        MIN_SAMPLES = 3
+
+        def _format_side(buckets, action_label):
+            lines = []
+            sorted_items = sorted(
+                buckets.items(),
+                key=lambda kv: kv[1]["score"] / max(kv[1]["total"], 1),
+                reverse=True,
+            )
+            strong, weak = [], []
+            for key, s in sorted_items:
+                n = s["total"]
+                if n < MIN_SAMPLES:
+                    continue
+                wr  = s["wins"] / n * 100
+                avg = s["score"] / n
+                tag = f"{key}: {wr:.0f}% win rate, avg score {avg:+.1f} (n={n})"
+                if avg >= 1.5:
+                    strong.append(f"    ✅ {tag}")
+                elif avg <= -1.0:
+                    weak.append(f"    ⚠️  {tag}")
+            out = []
+            if strong:
+                out.append(f"  {action_label} — high-edge conditions:")
+                out.extend(strong)
+            if weak:
+                out.append(f"  {action_label} — low/negative-edge conditions (avoid or shrink size):")
+                out.extend(weak)
+            return out
+
+        buy_lines  = _format_side(buy_buckets,  "BUY")
+        sell_lines = _format_side(sell_buckets, "SELL")
+
+        if not buy_lines and not sell_lines:
+            return ""
+
+        total_labeled = len(rows)
+        header = (
+            f"\n        **LEARNED STRATEGY PATTERNS (from {total_labeled} labeled trades — "
+            "use to size and filter current decision):**"
+        )
+        body_lines = buy_lines + sell_lines
+        body = "\n        ".join(body_lines)
+        return f"{header}\n        {body}\n"
+
     def analyze_with_chatgpt(self, chart_data, skip_chart_capture=False):
         """Send chart data to ChatGPT for analysis and get investment recommendation.
-        
+
         Args:
             chart_data: Comprehensive market data dictionary
             skip_chart_capture: If True, skip chart screenshot capture (useful for simulations)
@@ -1556,6 +1676,7 @@ class DogecoinAnalyzer:
             print("⏭️  Skipping chart capture for simulation")
         
         trade_learning_block = self._format_trade_learning_context(limit=30)
+        strategy_insights_block = self._generate_strategy_insights(limit=100)
         buy_streak = self._consecutive_buy_streak()
         aggressive = _trading_posture_aggressive()
         fee_gate_pct = _fee_gate_min_pct()
@@ -1691,7 +1812,7 @@ class DogecoinAnalyzer:
         - Fear & Greed: {chart_data['fear_greed_index'].get('current', dict()).get('value', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'} ({chart_data['fear_greed_index'].get('current', dict()).get('classification', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'})
 
         **Order Book:** Spread: ${chart_data['order_book'].get('spread', 'N/A')} ({chart_data['order_book'].get('spread_percent', 'N/A')}%) | Imbalance: {chart_data['order_book'].get('volume_imbalance', 'N/A')}%
-{trade_learning_block}{dry_powder_block}
+{strategy_insights_block}{trade_learning_block}{dry_powder_block}
         **OUTPUT JSON (strict format):**
         {{
             "recommendation": "BUY|SELL|HOLD",
