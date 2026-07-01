@@ -431,7 +431,9 @@ class DogecoinAnalyzer:
                 print(f"⚠️  Error calculating historical investment status: {e}")
         
         # Get current investment status (default behavior)
-        if not self.trading_enabled:
+        # Trade execution can be disabled when credentials are missing/invalid.
+        # In that mode, self.trade_executor is None and live balances cannot be queried.
+        if not self.trading_enabled or self.trade_executor is None:
             return None
         
         try:
