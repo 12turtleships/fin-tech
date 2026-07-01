@@ -52,7 +52,7 @@ def _fee_gate_min_pct() -> float:
             return max(0.0, float(raw))
         except ValueError:
             pass
-    return 1.25 if _trading_posture_aggressive() else 2.5
+    return 1.5 if _trading_posture_aggressive() else 2.5
 
 
 def _consecutive_buy_forbid_at() -> int:
@@ -63,7 +63,7 @@ def _consecutive_buy_forbid_at() -> int:
             return max(2, int(raw))
         except ValueError:
             pass
-    return 6 if _trading_posture_aggressive() else 3
+    return 4 if _trading_posture_aggressive() else 3
 
 # Import screen capture functionality
 from screen_capture import (
@@ -1435,6 +1435,29 @@ class DogecoinAnalyzer:
             except (TypeError, ValueError):
                 pass
 
+        # 5. Stop-Averaging-Down — block BUYs when price is >8% below avg cost basis AND DOGE >60% of portfolio
+        try:
+            doge_pct_sad = alloc.get("doge_percentage")
+            cur_price_sad = chart_data.get("current_price")
+            if (
+                doge_pct_sad is not None
+                and cur_price_sad is not None
+                and float(doge_pct_sad) > 60.0
+                and self.database_enabled
+                and self.db
+            ):
+                all_rows = self.db.get_all_trades()
+                _, avg_cost, _, _ = _replay_avg_cost_basis_per_trade(all_rows)
+                if avg_cost is not None and float(avg_cost) > 0:
+                    drawdown_vs_cost = (float(avg_cost) - float(cur_price_sad)) / float(avg_cost) * 100
+                    if drawdown_vs_cost >= 8.0:
+                        tripped.append(("STOP_AVG_DOWN",
+                            f"Price ${float(cur_price_sad):.6f} is {drawdown_vs_cost:.1f}% below avg cost basis "
+                            f"${float(avg_cost):.6f} (>8%) AND DOGE = {float(doge_pct_sad):.1f}% of portfolio (>60%). "
+                            f"Averaging down deeper blocked — HOLD or SELL only."))
+        except (TypeError, ValueError):
+            pass
+
         return tripped
 
     def _atr_capped_percentage(self, chart_data, llm_pct: float) -> float:
@@ -1644,6 +1667,11 @@ class DogecoinAnalyzer:
         **🚫 STRONG DOWNTREND: {msg}**
         BUY is BLOCKED by the circuit breaker. Output HOLD or SELL only.
 """
+            elif tag == "STOP_AVG_DOWN":
+                streak_block += f"""
+        **🚫 STOP AVERAGING DOWN: {msg}**
+        BUY is BLOCKED by the circuit breaker. Output HOLD or SELL only.
+"""
 
         posture_tag = "TRADING_POSTURE=aggressive" if aggressive else "TRADING_POSTURE=balanced"
         prompt = f"""
@@ -1722,7 +1750,7 @@ class DogecoinAnalyzer:
             if aggressive:
                 mandate_mid = f"""
 3. NO MAN'S LAND — When price trades between Bollinger bands without an obvious rubber-band **stretch**:
-   - **Do not automatically HOLD.** Lean **BUY 15–28%** when Fear & Greed < 30 and at least one of: RSI < 42, price below BB middle, or bid-heavy book skew.
+   - **Do not automatically HOLD.** Lean **BUY 15–35%** when Fear & Greed < 30 and at least one of: RSI < 42, price below BB middle, or bid-heavy book skew.
    - Be aggressive on the upside too: lean **SELL 22–40%** when price hugs upper band, asks dominate, or `dist_to_resistance_pct < 2%` (near 30d high).
    - Reserve pure HOLD for extreme chop: **very** narrow BB width **and** fee-edge far under **{tiny_fee:.2f}%** **and** sentiment not fearful.
 
@@ -4927,6 +4955,77 @@ def _resolve_trades_db_path(mode: str, db_explicit: Optional[str]) -> Optional[s
     return None
 
 
+def _generate_strategy_insights(db) -> None:
+    """
+    Print strategy insights by bucketing labeled trades into trending (ADX ≥ 25)
+    vs ranging (ADX < 25) regimes, so mean-reversion calibration is regime-aware.
+    """
+    all_rows = db.get_all_trades()
+    labeled = [r for r in all_rows if r.get("decision_correct") is not None]
+    if not labeled:
+        return
+
+    trending, ranging, no_adx = [], [], []
+    for row in labeled:
+        adx = None
+        try:
+            if row.get("analysis_id"):
+                ar = db.get_analysis_by_id(row["analysis_id"])
+                if ar and ar.get("market_data_id"):
+                    md = db.get_market_data_by_id(ar["market_data_id"])
+                    if md and md.get("technical_indicators_json"):
+                        ti = json.loads(md["technical_indicators_json"])
+                        adx = ti.get("adx")
+        except Exception:
+            pass
+        if adx is None:
+            no_adx.append(row)
+        else:
+            try:
+                (trending if float(adx) >= 25.0 else ranging).append(row)
+            except (TypeError, ValueError):
+                no_adx.append(row)
+
+    def _bucket_stats(rows, label):
+        if not rows:
+            return
+        n = len(rows)
+        correct = sum(1 for r in rows if r.get("decision_correct") == 1)
+        qs = [r["decision_quality_score"] for r in rows
+              if r.get("decision_quality_score") is not None]
+        avg_q = sum(qs) / len(qs) if qs else 0.0
+        buys = [r for r in rows if (r.get("action") or "").upper() == "BUY"]
+        sells = [r for r in rows if (r.get("action") or "").upper() == "SELL"]
+        buy_ok = sum(1 for r in buys if r.get("decision_correct") == 1)
+        sell_ok = sum(1 for r in sells if r.get("decision_correct") == 1)
+        parts = [f"{label}: {n} trades  accuracy={correct/n*100:.0f}%  avg_quality={avg_q:+.2f}"]
+        if buys:
+            parts.append(f"BUY acc={buy_ok/len(buys)*100:.0f}% ({len(buys)})")
+        if sells:
+            parts.append(f"SELL acc={sell_ok/len(sells)*100:.0f}% ({len(sells)})")
+        print("  " + "  ".join(parts))
+
+    print()
+    print("  REGIME-AWARE STRATEGY INSIGHTS  (ADX threshold = 25; mean-reversion ≠ trend-follow)")
+    print("  " + "-" * 72)
+    _bucket_stats(trending, "TRENDING (ADX ≥ 25)")
+    _bucket_stats(ranging,  "RANGING  (ADX < 25)")
+    if no_adx:
+        print(f"  {len(no_adx)} labeled trades had no ADX data and are excluded above.")
+    if trending and ranging:
+        t_acc = sum(1 for r in trending if r.get("decision_correct") == 1) / len(trending)
+        r_acc = sum(1 for r in ranging if r.get("decision_correct") == 1) / len(ranging)
+        if r_acc > t_acc + 0.10:
+            print("  Insight: Mean-reversion edge is stronger in RANGING markets — "
+                  "be cautious applying BB-bounce BUYs when ADX ≥ 25 (downtrend).")
+        elif t_acc > r_acc + 0.10:
+            print("  Insight: Strategy shows higher accuracy in TRENDING markets — "
+                  "review RANGING BUY entries; may be over-trading sideways chop.")
+        else:
+            print("  Insight: Accuracy is similar across regimes — no strong regime bias detected.")
+    print()
+
+
 def show_previous_trades(limit=30, db_path: Optional[str] = None):
     """Print previous transactions from SQLite (no OpenAI/Coinbase needed)."""
     if db_path == "__missing__":
@@ -5016,6 +5115,7 @@ def show_previous_trades(limit=30, db_path: Optional[str] = None):
             f"  Modeled avg cost after all rows: ${final_avg:.6f} / DOGE  (~{hold_model:,.2f} DOGE in replay vs ledger)"
         )
     print()
+    _generate_strategy_insights(db)
 
 
 def main():
