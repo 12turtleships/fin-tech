@@ -662,6 +662,40 @@ class TradingDatabase:
             """)
         return cursor.fetchall()
     
+    def get_labeled_trades_with_indicators(self, limit: int = 100):
+        """
+        JOIN trade_executions → analysis_results → market_data to return labeled
+        trades alongside the indicator conditions that existed at decision time.
+        Only returns BUY/SELL rows that have been quality-labeled.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT
+                te.id            AS trade_id,
+                te.timestamp     AS trade_ts,
+                te.action,
+                te.percentage    AS trade_pct,
+                te.current_price AS trade_price,
+                te.decision_correct,
+                te.decision_quality_label,
+                te.decision_quality_score,
+                md.rsi,
+                md.bb_upper,
+                md.bb_middle,
+                md.bb_lower,
+                md.fear_greed_index,
+                md.volume_imbalance,
+                md.technical_indicators_json
+            FROM trade_executions te
+            JOIN analysis_results ar ON te.analysis_id = ar.id
+            JOIN market_data md     ON ar.market_data_id = md.id
+            WHERE te.decision_quality_label IS NOT NULL
+              AND te.action IN ('BUY', 'SELL')
+            ORDER BY te.timestamp DESC
+            LIMIT ?
+        """, (limit,))
+        return cursor.fetchall()
+
     def close(self):
         """Close database connection."""
         self.conn.close()
