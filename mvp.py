@@ -5082,7 +5082,7 @@ def _generate_strategy_insights(db) -> None:
     Print strategy insights by bucketing labeled trades into trending (ADX ≥ 25)
     vs ranging (ADX < 25) regimes, so mean-reversion calibration is regime-aware.
     """
-    all_rows = db.get_all_trades()
+    all_rows = [dict(r) for r in db.get_all_trades()]
     labeled = [r for r in all_rows if r.get("decision_correct") is not None]
     if not labeled:
         return
