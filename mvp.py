@@ -15,7 +15,6 @@ from ta.trend import *
 from ta.momentum import *
 from ta.volatility import *
 from ta.volume import *
-from ta.utils import dropna
 from serpapi import GoogleSearch
 import base64
 from pathlib import Path
@@ -787,15 +786,18 @@ class DogecoinAnalyzer:
             return {}
         
         try:
-            # Clean the data
-            df_clean = dropna(df.copy())
-            
             # Ensure we have the required columns
             required_cols = ['open', 'high', 'low', 'close', 'volume']
-            if not all(col in df_clean.columns for col in required_cols):
+            if not all(col in df.columns for col in required_cols):
                 print("Warning: Missing required OHLCV columns")
                 return {}
-            
+
+            # Clean the data — drop rows only where OHLCV itself is NaN. Callers
+            # (e.g. prepare_comprehensive_data) may pass a df that already has derived
+            # columns like ma_30/returns attached, whose leading-window NaNs would
+            # otherwise cause ta.utils.dropna() to discard almost every row.
+            df_clean = df[required_cols].dropna().copy()
+
             # Check if we have enough data points for calculations
             # Note: We'll calculate what we can with available data (some indicators need fewer points)
             if len(df_clean) < 7:  # Minimum needed for shortest indicator (7-day SMA)
