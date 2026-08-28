@@ -29,7 +29,10 @@ jobs:
       INITIAL_CAPITAL_USD: ${{ secrets.INITIAL_CAPITAL_USD }}
       TRADING_POSTURE: aggressive
       CB_ENABLED: "1"
-      FEE_GATE_MIN_PCT: "1.5"
+      # Round-trip fee+slippage is ~2.33% (~1.16%/leg). 1.5 sat below that cost, so a
+      # trade could clear the gate and still lose money on fees alone. 3.0 clears the
+      # round-trip cost with margin.
+      FEE_GATE_MIN_PCT: "3.0"
       CB_ATR_RISK_PCT: "2.0"
       # 2 = the function's floor. Was 4 at 6h cadence (~24h of one-directional buying);
       # at daily cadence 4 would mean ~4 days, so this scales down with the schedule change.

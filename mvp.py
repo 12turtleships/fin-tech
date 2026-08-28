@@ -51,7 +51,11 @@ def _fee_gate_min_pct() -> float:
             return max(0.0, float(raw))
         except ValueError:
             pass
-    return 1.5 if _trading_posture_aggressive() else 2.5
+    # Coinbase Advanced taker fee + slippage measured at ~1.16%/leg (~2.33% round trip).
+    # Old defaults (1.5/2.5) sat below that cost, so a trade could clear the gate and
+    # still lose money on fees alone even with a perfect reversion. These clear the
+    # round-trip cost with margin.
+    return 3.0 if _trading_posture_aggressive() else 4.0
 
 
 def _consecutive_buy_forbid_at() -> int:

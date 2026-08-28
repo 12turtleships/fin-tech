@@ -111,7 +111,7 @@ INITIAL_CAPITAL_USD=1000
 
 # Trading behavior
 TRADING_POSTURE=aggressive        # aggressive | balanced | conservative
-FEE_GATE_MIN_PCT=0.75             # minimum BB fee-edge % to trade
+FEE_GATE_MIN_PCT=3.0              # minimum BB fee-edge % to trade (keep above ~2.33% round-trip fee cost)
 CB_ATR_RISK_PCT=3.5               # % of capital at risk per trade (ATR sizing)
 CONSECUTIVE_BUY_FORBID_AFTER=10   # max consecutive BUYs before forcing HOLD/SELL
 CB_ENABLED=0                      # set 1 to enable circuit breakers
