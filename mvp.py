@@ -1352,8 +1352,11 @@ class DogecoinAnalyzer:
     # Non-negotiable hard stops that override any LLM recommendation.
 
     # Tunables (class-level constants; override via env if desired)
-    # Circuit breakers are off by default. Set CB_ENABLED=1 to enable (drawdown, inventory cap, extreme vol, ADX downtrend).
-    _cb_env = (os.getenv("CB_ENABLED") or "0").strip().lower()
+    # Circuit breakers are ON by default (drawdown, inventory cap, extreme vol, ADX downtrend,
+    # stop-averaging-down). Backtesting actual vs. counterfactual trade history showed these
+    # roughly halve realized losses (-38.9% actual vs. -28.2% with breakers on from day 1) by
+    # cutting turnover, not by picking better entries. Set CB_ENABLED=0 to explicitly opt out.
+    _cb_env = (os.getenv("CB_ENABLED") or "1").strip().lower()
     CB_ENABLED = _cb_env not in ("0", "false", "no", "off")
     CB_DAILY_DRAWDOWN_PCT = float(os.getenv("CB_DAILY_DRAWDOWN_PCT", "4.0"))   # max 24h portfolio drop before sleep
     CB_SLEEP_HOURS        = float(os.getenv("CB_SLEEP_HOURS", "48"))            # how long to sleep after drawdown trip
