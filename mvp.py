@@ -62,7 +62,10 @@ def _consecutive_buy_forbid_at() -> int:
             return max(2, int(raw))
         except ValueError:
             pass
-    return 4 if _trading_posture_aggressive() else 3
+    # Was 4/3 (aggressive/conservative) calibrated for a 6h cadence (~24h/~18h of
+    # one-directional buying). At daily cadence that same wall-clock exposure window
+    # collapses to the function's floor of 2 (~2 days) regardless of posture.
+    return 2
 
 # Import screen capture functionality
 from screen_capture import (
@@ -1335,7 +1338,7 @@ class DogecoinAnalyzer:
             else:
                 break
         streak_forbid = _consecutive_buy_forbid_at()
-        streak_note_at = max(3, streak_forbid - 2)
+        streak_note_at = max(1, streak_forbid - 1)
         if buy_streak >= streak_note_at:
             lines.append(
                 f"  • **Cadence note:** The **{buy_streak} newest** rows above are consecutive **BUY** — "
@@ -1558,7 +1561,7 @@ class DogecoinAnalyzer:
         - Prior snapshot price: **${p0:.6f}** at **{ts}** → now **${p1:.6f}** → **{move_pct:+.3f}%** in DOGE{hrs_note}.
         - Prior logged recommendation: **{rec}** ({pct_s}).
         - **Read:** {hint}
-        - Use this **only as calibration** for the **next ~6h** decision: if you are about to repeat the same stance while last cycle’s **realized drift** hurt that stance, require **clearer** chart evidence this time.
+        - Use this **only as calibration** for the **next ~24h** decision: if you are about to repeat the same stance while last cycle’s **realized drift** hurt that stance, require **clearer** chart evidence this time.
 """
 
     def _generate_strategy_insights(self, limit: int = 100) -> str:
@@ -1802,10 +1805,10 @@ class DogecoinAnalyzer:
 
         posture_tag = "TRADING_POSTURE=aggressive" if aggressive else "TRADING_POSTURE=balanced"
         prompt = f"""
-        Analyze DOGE for the next ~6-hour automated trading cycle. Apply the Bargain Hunter mean-reversion strategy from your system prompt.{chart_image_note}
+        Analyze DOGE for the next ~24-hour automated trading cycle. Apply the Bargain Hunter mean-reversion strategy from your system prompt.{chart_image_note}
 
         **POSTURE:** {posture_tag} (override with env `TRADING_POSTURE` + optional `FEE_GATE_MIN_PCT`, `CONSECUTIVE_BUY_FORBID_AFTER`).
-        **EXECUTION CADENCE:** Bot runs every ~6 hours (cron). No intraday monitoring between runs.
+        **EXECUTION CADENCE:** Bot runs once daily (~24h, cron). No intraday monitoring between runs.
 {streak_block}
         📊 MARKET DATA:
 
@@ -1858,7 +1861,7 @@ class DogecoinAnalyzer:
             "risk_assessment": "Low|Medium|High",
             "risk_factors": ["<factor1>", "<factor2>"],
             "key_market_factors": ["<factor1>", "<factor2>"],
-            "timing_considerations": "<next 6h expectation>"
+            "timing_considerations": "<next 24h expectation>"
         }}
 
         **SIZE RULES:**
@@ -2605,7 +2608,7 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
                         trade_timestamp=trade_timestamp,
                         action=action,
                         trade_price=current_price,
-                        evaluation_window_hours=6
+                        evaluation_window_hours=24
                     )
                     
                     if ground_truth:
@@ -4244,15 +4247,15 @@ Limit your response to 300 words or less.
             return None
     
     def calculate_trade_ground_truth(self, trade_timestamp: datetime, action: str, 
-                                     trade_price: float, evaluation_window_hours: int = 6):
+                                     trade_price: float, evaluation_window_hours: int = 24):
         """
         Calculate ground truth for a trade by comparing price at trade time vs price after evaluation window.
-        
+
         Args:
             trade_timestamp: When the trade was made
             action: BUY, SELL, or HOLD
             trade_price: Price at time of trade
-            evaluation_window_hours: Hours after trade to evaluate (default: 6 hours, matches simulation interval)
+            evaluation_window_hours: Hours after trade to evaluate (default: 24 hours, matches live cadence)
         
         Returns:
             Dictionary with ground truth info: {'decision_correct': bool, 'price_change_percent': float, 

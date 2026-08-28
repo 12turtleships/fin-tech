@@ -1,6 +1,6 @@
 # DOGE Trading Bot — AI-Powered Crypto Trading System
 
-An end-to-end automated trading system for Dogecoin that combines real-time market data, technical analysis, and LLM-driven decision-making to execute trades on Coinbase Advanced. Runs continuously via GitHub Actions every 6 hours with a full audit trail stored in SQLite.
+An end-to-end automated trading system for Dogecoin that combines real-time market data, technical analysis, and LLM-driven decision-making to execute trades on Coinbase Advanced. Runs continuously via GitHub Actions once daily with a full audit trail stored in SQLite.
 
 ---
 
@@ -8,7 +8,7 @@ An end-to-end automated trading system for Dogecoin that combines real-time mark
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      GitHub Actions (every 6h)              │
+│                 GitHub Actions (once daily)                 │
 │                                                             │
 │  Market Data Layer          Analysis Layer    Execution     │
 │  ┌───────────────┐         ┌──────────────┐  ┌──────────┐  │
@@ -41,7 +41,7 @@ An end-to-end automated trading system for Dogecoin that combines real-time mark
 - **ATR-based position sizing** — automatically scales trade size to keep dollar-risk constant relative to current volatility
 - **Full audit trail** — every market snapshot, AI analysis, and trade execution is stored in SQLite with before/after balances
 - **Backtest & simulation** — replay the last N days using historical data without executing real trades
-- **CI/CD scheduling** — GitHub Actions runs the full cycle every 6 hours; SQLite DB is cached between runs and uploaded as a downloadable artifact
+- **CI/CD scheduling** — GitHub Actions runs the full cycle once daily; SQLite DB is cached between runs and uploaded as a downloadable artifact
 - **Balance reconciliation** — detects discrepancies between live Coinbase balances and the local DB snapshot
 
 ---
@@ -151,7 +151,7 @@ python reconcile_balances.py --ci
 
 ## GitHub Actions (Cloud Scheduling)
 
-The workflow at `.github/workflows/mvp-scheduled.yml` runs automatically every 6 hours at 00:20, 06:20, 12:20, 18:20 UTC — no local machine needed.
+The workflow at `.github/workflows/mvp-scheduled.yml` runs automatically once daily at 00:20 UTC — no local machine needed.
 
 **Required repository secrets** (Settings → Secrets → Actions):
 

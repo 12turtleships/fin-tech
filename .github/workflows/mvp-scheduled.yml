@@ -8,8 +8,8 @@ name: DOGE MVP scheduled
 
 on:
   schedule:
-    # Every 6 hours at :20 UTC (00:20, 06:20, 12:20, 18:20)
-    - cron: "20 */6 * * *"
+    # Once daily at 00:20 UTC
+    - cron: "20 0 * * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -31,7 +31,9 @@ jobs:
       CB_ENABLED: "1"
       FEE_GATE_MIN_PCT: "1.5"
       CB_ATR_RISK_PCT: "2.0"
-      CONSECUTIVE_BUY_FORBID_AFTER: "4"
+      # 2 = the function's floor. Was 4 at 6h cadence (~24h of one-directional buying);
+      # at daily cadence 4 would mean ~4 days, so this scales down with the schedule change.
+      CONSECUTIVE_BUY_FORBID_AFTER: "2"
 
     steps:
       - name: Checkout

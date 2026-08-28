@@ -1,13 +1,13 @@
-# Run mvp.py every 6 hours
+# Run mvp.py once a day
 
-The analysis prompt in `mvp.py` tells the model that **trades run on this same ~6-hour automatic schedule** (no intraday bot between runs), so recommendations match how the system actually operates.
+The analysis prompt in `mvp.py` tells the model that **trades run on this same ~24-hour automatic schedule** (no intraday bot between runs), so recommendations match how the system actually operates.
 
 ## 1. Runner script
 
 - **Script:** `run_mvp.sh` (in this folder)
 - It runs `python3 mvp.py` from `~/projects/fin-tech` and appends output to `logs/mvp-YYYYMMDD.log`.
 
-## 2. Add a cron job (every 6 hours)
+## 2. Add a cron job (once daily)
 
 Open crontab:
 
@@ -15,21 +15,15 @@ Open crontab:
 crontab -e
 ```
 
-Add one of these lines (choose one):
+Add this line:
 
-**Run at 00:00, 06:00, 12:00, 18:00:**
-
-```cron
-0 */6 * * * ~/projects/fin-tech/run_mvp.sh
-```
-
-**Run at 03:00, 09:00, 15:00, 21:00:**
+**Run once daily at 00:00:**
 
 ```cron
-0 3,9,15,21 * * * ~/projects/fin-tech/run_mvp.sh
+0 0 * * * ~/projects/fin-tech/run_mvp.sh
 ```
 
-Save and exit. Cron will run the script every 6 hours.
+Save and exit. Cron will run the script once a day.
 
 ## 3. Python environment (important for cron)
 
@@ -61,13 +55,13 @@ Then check `logs/mvp-$(date +%Y%m%d).log`.
 
 ---
 
-## 6. GitHub Actions (every 6 hours in the cloud)
+## 6. GitHub Actions (once daily in the cloud)
 
-Use this if your **Mac sleeps** and `cron` only fires when the machine is awake.
+Use this if your **Mac sleeps** and `cron` only fires when the machine is awake. This is the actively-used production path.
 
 - **Workflow:** `.github/workflows/mvp-scheduled.yml`
-- **Schedule:** `20 */6 * * *` in **UTC** (roughly 00:20, 06:20, 12:20, 18:20 UTC).  
-  - Example: Eastern Time is UTC−4 or UTC−5, so wall-clock times shift with DST.
+- **Schedule:** `20 0 * * *` in **UTC** (00:20 UTC, once daily).
+  - Example: Eastern Time is UTC−4 or UTC−5, so the wall-clock time shifts with DST.
 - **Secrets** (repo → **Settings → Secrets and variables → Actions**):
   - **Required:** `OPENAI_API_KEY`, `COINBASE_API_KEY`, `COINBASE_PRIVATE_KEY` (paste the full PEM / multi-line key; GitHub accepts it).
   - **Optional:** `SERPAPI_KEY`, `INITIAL_CAPITAL_USD`
