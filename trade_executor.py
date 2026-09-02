@@ -20,6 +20,11 @@ load_dotenv()
 # Coinbase Advanced Trade minimum order size (quote) for DOGE-USD is $1; use slightly higher to avoid rejections
 MIN_BUY_USD = 2.0
 
+# place_sell_order() floors DOGE amounts to a whole unit (DOGE-USD base_size has no
+# fractional precision on Coinbase Advanced). A SELL below 1 DOGE floors to base_size=0,
+# which Coinbase rejects outright -- so skip it here instead of sending a doomed order.
+MIN_SELL_DOGE = 1.0
+
 class CoinbaseTradeExecutor:
     def __init__(self):
         """Initialize the trade executor with Coinbase Advanced API credentials.
@@ -542,7 +547,10 @@ class CoinbaseTradeExecutor:
             if amount_to_sell > current_balance_doge:
                 print(f"❌ Insufficient DOGE balance. Need {amount_to_sell:.2f}, have {current_balance_doge:.2f}")
                 return False
-            
+            if amount_to_sell < MIN_SELL_DOGE:
+                print(f"⏭️  Skipping SELL: amount {amount_to_sell:.4f} DOGE floors to 0 whole DOGE (min {MIN_SELL_DOGE:.0f}). Order would be rejected by Coinbase.")
+                return False
+
             print(f"💸 Selling {amount_to_sell:.2f} DOGE ({percentage}% of DOGE balance)")
             return self.place_sell_order(amount_to_sell)
             
