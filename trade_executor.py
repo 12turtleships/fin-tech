@@ -25,6 +25,11 @@ MIN_BUY_USD = 2.0
 # which Coinbase rejects outright -- so skip it here instead of sending a doomed order.
 MIN_SELL_DOGE = 1.0
 
+# Mirrors MIN_BUY_USD: once the DOGE position is ground down to dust, a fee-edge-passing
+# SELL signal can still be economically pointless in absolute terms (e.g. $0.09 of proceeds).
+# Skip sells below this notional value rather than spending a real fee on pocket change.
+MIN_SELL_USD = 2.0
+
 class CoinbaseTradeExecutor:
     def __init__(self):
         """Initialize the trade executor with Coinbase Advanced API credentials.
@@ -549,6 +554,10 @@ class CoinbaseTradeExecutor:
                 return False
             if amount_to_sell < MIN_SELL_DOGE:
                 print(f"⏭️  Skipping SELL: amount {amount_to_sell:.4f} DOGE floors to 0 whole DOGE (min {MIN_SELL_DOGE:.0f}). Order would be rejected by Coinbase.")
+                return False
+            notional_usd = amount_to_sell * current_price
+            if notional_usd < MIN_SELL_USD:
+                print(f"⏭️  Skipping SELL: notional ${notional_usd:.2f} is below minimum order size (${MIN_SELL_USD:.2f}). Position is too small to trade economically.")
                 return False
 
             print(f"💸 Selling {amount_to_sell:.2f} DOGE ({percentage}% of DOGE balance)")
