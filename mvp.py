@@ -772,13 +772,12 @@ class DogecoinAnalyzer:
             
             client = openai.OpenAI(api_key=self.openai_api_key)
             response = client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-6.1-sol",
                 messages=[
                     {"role": "system", "content": "You are a financial news analyst specializing in cryptocurrency market sentiment analysis."},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=10000,
-                temperature=0.6
+                max_completion_tokens=10000,  # gpt-6.1-sol: 'max_tokens' unsupported, only default temperature=1 allowed
             )
             
             return response.choices[0].message.content
@@ -1355,6 +1354,169 @@ class DogecoinAnalyzer:
         {body}
 """
 
+    def _format_self_reflection_context(self, limit: int = 3) -> str:
+        """
+        Pull the bot's own last few self-reflection journal entries back into the decision
+        prompt, so today's recommendation can act on yesterday's self-criticism instead of
+        reasoning from scratch every cycle. This read, paired with the write in
+        generate_self_reflection_journal(), is the recursive-improvement loop: each entry is
+        written with the previous ones in view, and each decision is made with the latest
+        entry in view.
+        """
+        if not self.database_enabled or not self.db:
+            return ""
+        try:
+            rows = self.db.get_recent_self_reflections(limit=limit)
+        except Exception:
+            return ""
+        if not rows:
+            return ""
+        lines = []
+        for row in rows:
+            ts = (row["timestamp"] or "")[:19].replace("T", " ")
+            rec = row["recommendation"] or "?"
+            pct = row["percentage"]
+            pct_s = f"{pct:.0f}%" if pct is not None else "—"
+            entry = (row["self_reflection"] or "").strip().replace("\n", " ")
+            lines.append(f"  • [{ts}] (decided {rec} {pct_s}): {entry}")
+        body = "\n        ".join(lines)
+        return f"""
+        **YOUR OWN SELF-REFLECTION JOURNAL (newest first, written by you after past cycles —
+        weigh these when sizing/filtering today's decision; if a past entry flagged a mistake, don't repeat it):**
+        {body}
+"""
+
+    def generate_self_reflection_journal(self, chart_data: dict, analysis_id, days: int = 7):
+        """
+        Write a recursive self-reflection journal entry for this cycle.
+
+        Combines recently accumulated trade performance (DB) with the current market
+        snapshot (chart_data), reads back the bot's own last few journal entries, and asks
+        the AI to judge whether its past reflection held up and what to do differently.
+        Saves the entry onto analysis_results.self_reflection, keyed by analysis_id, so the
+        next cycle's _format_self_reflection_context() can read it back into the prompt.
+        """
+        if not self.database_enabled or not self.db or not analysis_id:
+            return None
+        if not self.openai_api_key:
+            return None
+
+        try:
+            performance_pct = self.calculate_trading_performance(days=days)
+        except Exception:
+            performance_pct = 0.0
+
+        trades = []
+        try:
+            trades = self.db.get_all_trades(days=days) or []
+        except Exception as e:
+            print(f"⚠️  Could not load trades for self-reflection: {e}")
+
+        quality_counts = {}
+        quality_scores = []
+        correct = incorrect = 0
+        for t in trades:
+            dc = t["decision_correct"]
+            if dc == 1:
+                correct += 1
+            elif dc == 0:
+                incorrect += 1
+            ql = t["decision_quality_label"] or "unlabeled"
+            quality_counts[ql] = quality_counts.get(ql, 0) + 1
+            qs = t["decision_quality_score"]
+            if isinstance(qs, (int, float)):
+                quality_scores.append(qs)
+        avg_quality = sum(quality_scores) / len(quality_scores) if quality_scores else 0.0
+
+        try:
+            past_entries = self.db.get_recent_self_reflections(limit=5) or []
+        except Exception as e:
+            print(f"⚠️  Could not load past self-reflections: {e}")
+            past_entries = []
+
+        if past_entries:
+            past_journal_text = "\n\n".join(
+                f"[{row['timestamp'][:19].replace('T', ' ')}] (decided then: {row['recommendation']} {row['percentage']}%)\n{row['self_reflection']}"
+                for row in reversed(past_entries)
+            )
+        else:
+            past_journal_text = "(no prior journal entries yet - this is the first one)"
+
+        inv = chart_data.get("investment_status") or {}
+        alloc = inv.get("current_allocation") or {}
+        tech = chart_data.get("technical_indicators_30d") or {}
+        fg = chart_data.get("fear_greed_index") or {}
+        fg_current = fg.get("current") or {}
+
+        market_snapshot = {
+            "price": chart_data.get("current_price"),
+            "price_change_30d_pct": chart_data.get("price_change_percent"),
+            "volatility_30d_pct": chart_data.get("volatility_30d"),
+            "volatility_24h_pct": chart_data.get("volatility_24h"),
+            "rsi": tech.get("rsi"),
+            "macd": tech.get("macd"),
+            "bb_width_pct": chart_data.get("bb_width_pct"),
+            "fee_edge_pct": chart_data.get("fee_edge_pct"),
+            "fear_greed": fg_current.get("value"),
+            "fear_greed_label": fg_current.get("classification"),
+            "portfolio_value": inv.get("portfolio_value"),
+            "usd_pct": alloc.get("usd_percentage"),
+            "doge_pct": alloc.get("doge_percentage"),
+            "latest_recommendation": (self.latest_analysis_json or {}).get("recommendation"),
+            "latest_percentage": (self.latest_analysis_json or {}).get("percentage"),
+        }
+
+        prompt = f"""
+You are writing the trading diary for a Dogecoin automated-trading bot. Synthesize the data
+below, check whether your own past journal entries actually turned out to be right, and write
+a "self-reflection journal entry" with concrete lessons for making better decisions going forward.
+
+**Trading performance, last {days} days:**
+- Return: {performance_pct:.2f}%
+- Correct decisions: {correct} / Incorrect decisions: {incorrect}
+- Average decision quality score: {avg_quality:.2f} (-4 to +4)
+- Quality distribution: {json.dumps(quality_counts, ensure_ascii=False)}
+
+**Current market conditions:**
+{json.dumps(market_snapshot, indent=2, ensure_ascii=False, default=str)}
+
+**Past journal entries (oldest first, most recent {len(past_entries)}):**
+{past_journal_text}
+
+Write the following in 5-8 sentences or fewer:
+1. How what you expected/committed to in past entries differed from what actually happened (and why, if you were wrong)
+2. Whether any past pattern is worth reapplying given current market conditions
+3. One or two concrete, specific action items for what to do differently in the next trading decision
+
+Write in English, in a plain, honest, first-person diary tone. Don't exaggerate - ground it in the data.
+"""
+
+        try:
+            client = openai.OpenAI(api_key=self.openai_api_key)
+            response = client.chat.completions.create(
+                model="gpt-6.1-sol",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a disciplined trading bot writing an honest, "
+                                    "data-grounded self-reflection journal entry in English.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_completion_tokens=600,  # gpt-6.1-sol: 'max_tokens' unsupported, only default temperature=1 allowed
+            )
+            journal_entry = response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"⚠️  Failed to generate self-reflection journal: {e}")
+            return None
+
+        try:
+            self.db.save_self_reflection(analysis_id, journal_entry)
+        except Exception as e:
+            print(f"⚠️  Failed to save self-reflection journal: {e}")
+
+        return journal_entry
+
     # ─── CIRCUIT BREAKERS & INDUSTRIAL GOVERNANCE ───────────────────────
     # Non-negotiable hard stops that override any LLM recommendation.
 
@@ -1714,6 +1876,7 @@ class DogecoinAnalyzer:
         
         trade_learning_block = self._format_trade_learning_context(limit=30)
         strategy_insights_block = self._generate_strategy_insights(limit=100)
+        self_reflection_block = self._format_self_reflection_context(limit=3)
         buy_streak = self._consecutive_buy_streak()
         aggressive = _trading_posture_aggressive()
         fee_gate_pct = _fee_gate_min_pct()
@@ -1854,7 +2017,7 @@ class DogecoinAnalyzer:
         - Fear & Greed: {chart_data['fear_greed_index'].get('current', dict()).get('value', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'} ({chart_data['fear_greed_index'].get('current', dict()).get('classification', 'N/A') if chart_data.get('fear_greed_index') else 'N/A'})
 
         **Order Book:** Spread: ${chart_data['order_book'].get('spread', 'N/A')} ({chart_data['order_book'].get('spread_percent', 'N/A')}%) | Imbalance: {chart_data['order_book'].get('volume_imbalance', 'N/A')}%
-{strategy_insights_block}{trade_learning_block}{dry_powder_block}
+{strategy_insights_block}{trade_learning_block}{self_reflection_block}{dry_powder_block}
         **OUTPUT JSON (strict format):**
         {{
             "recommendation": "BUY|SELL|HOLD",
@@ -2047,10 +2210,9 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
             # Note: OpenAI's response_format currently only supports {"type": "json_object"}
             # JSON Schema validation is done manually after parsing
             response = client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-6.1-sol",
                 messages=messages,
-                max_tokens=10000,  # Increased for structured JSON output
-                temperature=(0.55 if aggressive else 0.3),
+                max_completion_tokens=10000,  # gpt-6.1-sol: 'max_tokens' unsupported, only default temperature=1 allowed
                 response_format={"type": "json_object"}  # Force JSON output, schema validated manually
             )
             
@@ -3166,7 +3328,17 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
                 )
             except Exception as e:
                 print(f"⚠️  Failed to save analysis result to database: {e}")
-        
+
+        # Write this cycle's self-reflection journal entry (combines accumulated trade
+        # history + current market snapshot + the bot's own past journal entries), saved
+        # back onto this analysis row so the next cycle's prompt can read it.
+        if analysis_id and self.database_enabled:
+            try:
+                print("📓 Writing self-reflection journal entry...")
+                self.generate_self_reflection_journal(comprehensive_data, analysis_id)
+            except Exception as e:
+                print(f"⚠️  Failed to generate self-reflection journal: {e}")
+
         # Parse and highlight percentage recommendations
         highlighted_analysis = self.highlight_percentage_recommendations(analysis)
         
@@ -3760,8 +3932,9 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
         
         # Generate reflection using OpenAI
         try:
-            response = openai.ChatCompletion.create(
-                model="gpt-4o-2024-08-06",
+            client = openai.OpenAI(api_key=self.openai_api_key)
+            response = client.chat.completions.create(
+                model="gpt-6.1-sol",
                 messages=[
                     {
                         "role": "system",

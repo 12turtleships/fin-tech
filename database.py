@@ -163,7 +163,16 @@ class TradingDatabase:
             cursor.execute("ALTER TABLE trade_executions ADD COLUMN decision_quality_score INTEGER")
         except sqlite3.OperationalError:
             pass  # Column already exists
-        
+
+        # Recursive self-reflection journal: one AI-written diary entry per analysis cycle,
+        # combining accumulated trade history with that cycle's market snapshot. Stored on
+        # analysis_results (one row per cycle) so each entry is naturally timestamped/ordered,
+        # and future cycles can read past entries back out of this same column to improve.
+        try:
+            cursor.execute("ALTER TABLE analysis_results ADD COLUMN self_reflection TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         # Create indexes for better query performance
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_market_data_timestamp ON market_data(timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_analysis_timestamp ON analysis_results(timestamp)")
@@ -554,6 +563,53 @@ class TradingDatabase:
         """, (limit,))
         return cursor.fetchall()
     
+    def save_self_reflection(self, analysis_id: int, reflection_text: str) -> bool:
+        """
+        Attach a recursive self-reflection journal entry to an analysis_results row.
+
+        Args:
+            analysis_id: ID of the analysis_results record for this cycle
+            reflection_text: AI-written diary entry summarizing recent performance,
+                              current market conditions, and what should change next time
+
+        Returns:
+            True if the update was successful, False otherwise
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE analysis_results SET self_reflection = ? WHERE id = ?",
+            (reflection_text, analysis_id),
+        )
+        if cursor.rowcount > 0:
+            self.conn.commit()
+            print(f"✅ Self-reflection journal entry saved (Analysis ID: {analysis_id})")
+            return True
+        print(f"⚠️  Analysis ID {analysis_id} not found - could not save self-reflection")
+        return False
+
+    def get_recent_self_reflections(self, limit: int = 5):
+        """
+        Get the most recent self-reflection journal entries, newest first.
+
+        Used to feed the bot's own past journal entries back into the next cycle's
+        prompt, so each new entry can build on (and check itself against) prior ones.
+
+        Args:
+            limit: Maximum number of entries to return
+
+        Returns:
+            List of rows with id, timestamp, recommendation, percentage, self_reflection
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT id, timestamp, recommendation, percentage, self_reflection
+            FROM analysis_results
+            WHERE self_reflection IS NOT NULL AND self_reflection != ''
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (limit,))
+        return cursor.fetchall()
+
     def get_trade_by_id(self, trade_id: int):
         """
         Get a specific trade execution by ID.
