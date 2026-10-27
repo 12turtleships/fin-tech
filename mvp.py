@@ -2946,7 +2946,7 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
         except Exception as e:
             print(f"⚠️  Failed to save reflection: {e}")
 
-    def backfill_pending_trade_reflections(self, limit: int = 20):
+    def backfill_pending_trade_reflections(self, limit: int = 300):
         """
         Retry grading for trades still stuck without a real decision_quality_label.
 
@@ -2956,6 +2956,11 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
         'unknown' forever. Call this once per cycle (before building today's decision prompt)
         to re-attempt grading on any trade whose 24h window has now passed; trades still too
         fresh just save 'unknown' again harmlessly.
+
+        limit defaults high enough to drain the entire historical backlog (~230 trades as of
+        2026-10-27) in a single cycle, not just a daily trickle - each retry is a couple of
+        free Coinbase public-candle lookups, no LLM cost, so there's no real reason to throttle
+        it once the one-time backlog is gone; steady-state pending count should stay near zero.
         """
         if not self.database_enabled or not self.db:
             return
