@@ -1442,6 +1442,36 @@ class DogecoinAnalyzer:
         else:
             past_journal_text = "(no prior journal entries yet - this is the first one)"
 
+        # The most recent completed trade, graded against today's price - this is what
+        # actually turns "reflection" into a real retrospective instead of commentary on a
+        # not-yet-executed recommendation (this function runs before execute_recommended_trade,
+        # so it can't know today's own outcome yet; it CAN grade yesterday's, now that time
+        # has passed and a new price is in).
+        last_trade_text = "(no prior trades recorded yet)"
+        try:
+            last_trade_rows = self.db.get_recent_trades(limit=1)
+        except Exception as e:
+            print(f"⚠️  Could not load most recent trade for self-reflection: {e}")
+            last_trade_rows = []
+        if last_trade_rows:
+            lt = last_trade_rows[0]
+            exec_price = lt["current_price"]
+            now_price = chart_data.get("current_price")
+            price_change_pct = None
+            if exec_price and now_price:
+                try:
+                    price_change_pct = (float(now_price) - float(exec_price)) / float(exec_price) * 100
+                except (TypeError, ZeroDivisionError):
+                    price_change_pct = None
+            last_trade_text = (
+                f"[{(lt['timestamp'] or '')[:19].replace('T', ' ')}] {lt['action']} {lt['percentage']}% "
+                f"at ${exec_price:.6f}" if exec_price is not None else
+                f"[{(lt['timestamp'] or '')[:19].replace('T', ' ')}] {lt['action']} {lt['percentage']}% (no execution price recorded)"
+            )
+            last_trade_text += f", executed={'yes' if lt['success'] else 'no (skipped/failed)'}"
+            if price_change_pct is not None:
+                last_trade_text += f". Price then: ${exec_price:.6f} -> price now: ${now_price:.6f} ({price_change_pct:+.2f}%)."
+
         inv = chart_data.get("investment_status") or {}
         alloc = inv.get("current_allocation") or {}
         tech = chart_data.get("technical_indicators_30d") or {}
@@ -1467,9 +1497,12 @@ class DogecoinAnalyzer:
         }
 
         prompt = f"""
-You are writing the trading diary for a Dogecoin automated-trading bot. Synthesize the data
-below, check whether your own past journal entries actually turned out to be right, and write
+You are writing the trading diary for a Dogecoin automated-trading bot. Your main job in this
+entry is to grade your most recent completed trade now that a new price has come in, then write
 a "self-reflection journal entry" with concrete lessons for making better decisions going forward.
+
+**Most recent trade (grade this against the price move since):**
+{last_trade_text}
 
 **Trading performance, last {days} days:**
 - Return: {performance_pct:.2f}%
@@ -1484,9 +1517,12 @@ a "self-reflection journal entry" with concrete lessons for making better decisi
 {past_journal_text}
 
 Write the following in 5-8 sentences or fewer:
-1. How what you expected/committed to in past entries differed from what actually happened (and why, if you were wrong)
-2. Whether any past pattern is worth reapplying given current market conditions
-3. One or two concrete, specific action items for what to do differently in the next trading decision
+1. Grade the most recent trade above: given the price move since it executed, did that BUY/SELL
+   (or skip) work out, and why - was it good timing, early, late, or a wash? Use the actual numbers.
+2. How what you expected/committed to in past journal entries differed from what actually happened
+   (and why, if you were wrong)
+3. Whether any past pattern is worth reapplying given current market conditions
+4. One or two concrete, specific action items for what to do differently in the next trading decision
 
 Write in English, in a plain, honest, first-person diary tone. Don't exaggerate - ground it in the data.
 """
@@ -2751,17 +2787,22 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
             print("⚠️  Trade not found in database")
             return
         
-        # Check if ground truth already exists
-        # sqlite3.Row doesn't support .get(), use dictionary-style access
-        decision_correct = trade['decision_correct'] if 'decision_correct' in trade else None
-        quality_label = trade['decision_quality_label'] if 'decision_quality_label' in trade else None
-        quality_score = trade['decision_quality_score'] if 'decision_quality_score' in trade else None
+        # Check if ground truth already exists.
+        # Note: sqlite3.Row's `in` checks VALUES, not column names (e.g. 'timestamp' in row
+        # is False even though the column exists) - index directly instead; every column
+        # below always exists on trade_executions, so this can't KeyError.
+        decision_correct = trade['decision_correct']
+        quality_label = trade['decision_quality_label']
+        quality_score = trade['decision_quality_score']
         price_change_percent = None
-        
-        # If ground truth doesn't exist yet, calculate it
-        if decision_correct is None or quality_label is None:
+
+        # If ground truth doesn't exist yet, calculate it. 'unknown' is the placeholder saved
+        # when the 24h evaluation window hadn't elapsed yet at save time - treat it the same as
+        # not-yet-graded so a later retry (see backfill_pending_trade_reflections) can replace
+        # it with a real grade once enough time has passed.
+        if decision_correct is None or quality_label is None or quality_label == 'unknown':
             from datetime import datetime as dt_class
-            trade_timestamp_str = trade['timestamp'] if 'timestamp' in trade else None
+            trade_timestamp_str = trade['timestamp']
             if trade_timestamp_str:
                 try:
                     if isinstance(trade_timestamp_str, str):
@@ -2796,7 +2837,7 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
         else:
             # Ground truth exists, try to extract price change from existing reflection
             import re
-            reflection_text = trade['reflection'] if 'reflection' in trade else ''
+            reflection_text = trade['reflection'] or ''
             if reflection_text:
                 price_match = re.search(r'Price change:\s*([+-]?\d+\.?\d*)%', reflection_text)
                 if price_match:
@@ -2870,7 +2911,36 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
                 print(f"   Price change: {price_change_percent:.2f}%")
         except Exception as e:
             print(f"⚠️  Failed to save reflection: {e}")
-    
+
+    def backfill_pending_trade_reflections(self, limit: int = 20):
+        """
+        Retry grading for trades still stuck without a real decision_quality_label.
+
+        prompt_trade_reflection() runs right after a trade executes, when the 24h evaluation
+        window hasn't elapsed yet - so every trade saves the 'unknown' placeholder at first.
+        Nothing retried those automatically before this method existed, so they stayed
+        'unknown' forever. Call this once per cycle (before building today's decision prompt)
+        to re-attempt grading on any trade whose 24h window has now passed; trades still too
+        fresh just save 'unknown' again harmlessly.
+        """
+        if not self.database_enabled or not self.db:
+            return
+        try:
+            pending = self.db.get_trades_needing_quality_grade(limit=limit)
+        except Exception as e:
+            print(f"⚠️  Could not load trades needing a quality grade: {e}")
+            return
+        if not pending:
+            return
+        print(f"🔁 Retrying quality grade for {len(pending)} pending trade(s)...")
+        for trade in pending:
+            self.prompt_trade_reflection(
+                trade_id=trade["id"],
+                action=trade["action"],
+                percentage=trade["percentage"],
+                current_price=trade["current_price"],
+            )
+
     def _execute_simulated_trade_no_api(self, action: str, percentage: float, analysis_id: Optional[int] = None) -> bool:
         """
         Execute a simulated trade when API credentials are not available.
@@ -3312,6 +3382,14 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
 
         # Store for ATR-based position capping during execution
         self._latest_chart_data = comprehensive_data
+
+        # Retry grading on any trade whose 24h evaluation window has now passed, so today's
+        # decision (trade learning context, strategy insights) and journal entry see real
+        # win/loss grades instead of the 'unknown' placeholder every trade starts with.
+        try:
+            self.backfill_pending_trade_reflections()
+        except Exception as e:
+            print(f"⚠️  Failed to backfill pending trade reflections: {e}")
 
         # Get ChatGPT analysis
         print("🤖 Getting comprehensive AI analysis from ChatGPT...")

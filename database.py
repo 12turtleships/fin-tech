@@ -544,6 +544,29 @@ class TradingDatabase:
             print(f"⚠️  Trade ID {trade_id} not found")
             return False
     
+    def get_trades_needing_quality_grade(self, limit: int = 20):
+        """
+        Get successful trades that still need a real decision_quality_label - either never
+        graded (NULL) or stuck on the 'unknown' placeholder saved when the 24h evaluation
+        window hadn't elapsed yet at save time. Oldest first, so the backlog drains in order
+        and the oldest (most likely to now be gradable) trades are retried first.
+
+        Args:
+            limit: Maximum number of trades to return
+
+        Returns:
+            List of trade execution records needing a quality grade
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT * FROM trade_executions
+            WHERE success = 1
+              AND (decision_quality_label IS NULL OR decision_quality_label = 'unknown')
+            ORDER BY timestamp ASC
+            LIMIT ?
+        """, (limit,))
+        return cursor.fetchall()
+
     def get_trades_needing_reflection(self, limit: int = 10):
         """
         Get trades that don't have a reflection yet.
