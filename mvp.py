@@ -1377,8 +1377,10 @@ class DogecoinAnalyzer:
             rec = row["recommendation"] or "?"
             pct = row["percentage"]
             pct_s = f"{pct:.0f}%" if pct is not None else "—"
+            judgment = (row["self_reflection_judgment"] or "").strip()
+            judgment_s = f" [{judgment}]" if judgment else ""
             entry = (row["self_reflection"] or "").strip().replace("\n", " ")
-            lines.append(f"  • [{ts}] (decided {rec} {pct_s}): {entry}")
+            lines.append(f"  • [{ts}] (decided {rec} {pct_s}){judgment_s}: {entry}")
         body = "\n        ".join(lines)
         return f"""
         **YOUR OWN SELF-REFLECTION JOURNAL (newest first, written by you after past cycles —
@@ -1436,18 +1438,27 @@ class DogecoinAnalyzer:
 
         if past_entries:
             past_journal_text = "\n\n".join(
-                f"[{row['timestamp'][:19].replace('T', ' ')}] (decided then: {row['recommendation']} {row['percentage']}%)\n{row['self_reflection']}"
+                f"[{row['timestamp'][:19].replace('T', ' ')}] (decided then: {row['recommendation']} {row['percentage']}%"
+                f"{', judgment: ' + row['self_reflection_judgment'] if row['self_reflection_judgment'] else ''})\n{row['self_reflection']}"
                 for row in reversed(past_entries)
             )
         else:
             past_journal_text = "(no prior journal entries yet - this is the first one)"
 
-        # The most recent completed trade, graded against today's price - this is what
+        # The most recent completed trade, judged against today's price - this is what
         # actually turns "reflection" into a real retrospective instead of commentary on a
         # not-yet-executed recommendation (this function runs before execute_recommended_trade,
-        # so it can't know today's own outcome yet; it CAN grade yesterday's, now that time
+        # so it can't know today's own outcome yet; it CAN judge yesterday's, now that time
         # has passed and a new price is in).
+        #
+        # The PROFIT/LOSS/BREAKEVEN verdict is computed here in code, not left to the model to
+        # narrate - the model's job is to explain WHY this judgment happened and what to do
+        # about it, not to re-derive the verdict itself. BUY wants price up after buying;
+        # SELL wants price down after selling - so the same raw price move is profit for one
+        # action and loss for the other.
         last_trade_text = "(no prior trades recorded yet)"
+        judgment_label = None
+        judgment_text = "(no prior trade to judge yet)"
         try:
             last_trade_rows = self.db.get_recent_trades(limit=1)
         except Exception as e:
@@ -1455,6 +1466,7 @@ class DogecoinAnalyzer:
             last_trade_rows = []
         if last_trade_rows:
             lt = last_trade_rows[0]
+            action = (lt["action"] or "").upper()
             exec_price = lt["current_price"]
             now_price = chart_data.get("current_price")
             price_change_pct = None
@@ -1471,6 +1483,22 @@ class DogecoinAnalyzer:
             last_trade_text += f", executed={'yes' if lt['success'] else 'no (skipped/failed)'}"
             if price_change_pct is not None:
                 last_trade_text += f". Price then: ${exec_price:.6f} -> price now: ${now_price:.6f} ({price_change_pct:+.2f}%)."
+
+            if lt["success"] and price_change_pct is not None and action in ("BUY", "SELL"):
+                # Directional: a BUY wants this positive, a SELL wants this negative.
+                directional_pct = price_change_pct if action == "BUY" else -price_change_pct
+                if abs(directional_pct) < 0.1:
+                    judgment_label = "BREAKEVEN"
+                elif directional_pct > 0:
+                    judgment_label = "PROFIT"
+                else:
+                    judgment_label = "LOSS"
+                judgment_text = (
+                    f"{judgment_label}: {action} {lt['percentage']}% @ ${exec_price:.6f} -> "
+                    f"${float(now_price):.6f} ({price_change_pct:+.2f}% price move since trade)"
+                )
+            elif not lt["success"]:
+                judgment_text = f"N/A - last trade ({action} {lt['percentage']}%) was skipped/failed, nothing was executed to judge"
 
         inv = chart_data.get("investment_status") or {}
         alloc = inv.get("current_allocation") or {}
@@ -1497,11 +1525,15 @@ class DogecoinAnalyzer:
         }
 
         prompt = f"""
-You are writing the trading diary for a Dogecoin automated-trading bot. Your main job in this
-entry is to grade your most recent completed trade now that a new price has come in, then write
-a "self-reflection journal entry" with concrete lessons for making better decisions going forward.
+You are writing the trading diary for a Dogecoin automated-trading bot. A judgment on your most
+recent trade has already been computed from real price data below - it is a GIVEN FACT, not
+something for you to re-derive or second-guess. Your job is to explain why that judgment happened,
+draw lessons from it, and use that to set today's plan.
 
-**Most recent trade (grade this against the price move since):**
+**JUDGMENT ON YOUR MOST RECENT TRADE (computed, not your opinion - treat as ground truth):**
+{judgment_text}
+
+**Trade detail:**
 {last_trade_text}
 
 **Trading performance, last {days} days:**
@@ -1516,13 +1548,15 @@ a "self-reflection journal entry" with concrete lessons for making better decisi
 **Past journal entries (oldest first, most recent {len(past_entries)}):**
 {past_journal_text}
 
-Write the following in 5-8 sentences or fewer:
-1. Grade the most recent trade above: given the price move since it executed, did that BUY/SELL
-   (or skip) work out, and why - was it good timing, early, late, or a wash? Use the actual numbers.
-2. How what you expected/committed to in past journal entries differed from what actually happened
-   (and why, if you were wrong)
+Write the following in 6-9 sentences or fewer, in this order:
+1. State the judgment above (PROFIT/LOSS/BREAKEVEN) and explain WHY it happened - what market
+   signal drove the decision, and why that did or didn't play out. If it was a loss, say
+   specifically what was missed or misjudged; if a profit, say what actually worked. Don't
+   hedge or claim you can't evaluate it - the judgment is already computed for you.
+2. How what you expected/committed to in past journal entries compares to what actually happened
 3. Whether any past pattern is worth reapplying given current market conditions
-4. One or two concrete, specific action items for what to do differently in the next trading decision
+4. Today's plan: one or two concrete, specific actions for the next trading decision, directly
+   informed by why the last trade won or lost
 
 Write in English, in a plain, honest, first-person diary tone. Don't exaggerate - ground it in the data.
 """
@@ -1547,7 +1581,7 @@ Write in English, in a plain, honest, first-person diary tone. Don't exaggerate 
             return None
 
         try:
-            self.db.save_self_reflection(analysis_id, journal_entry)
+            self.db.save_self_reflection(analysis_id, journal_entry, judgment=judgment_text)
         except Exception as e:
             print(f"⚠️  Failed to save self-reflection journal: {e}")
 

@@ -416,11 +416,19 @@ with tab_journal:
         if j_df.empty:
             st.info("No journal entries yet — one is written automatically on the bot's next scheduled run.")
         else:
+            badge_color = {"PROFIT": "green", "LOSS": "red", "BREAKEVEN": "gray"}
             for _, row in j_df.sort_values("timestamp", ascending=False).iterrows():
                 ts = row["timestamp"]
                 rec = row.get("recommendation") or "?"
                 pct = row.get("percentage")
                 pct_s = f"{pct:.0f}%" if pd.notna(pct) else "—"
                 ts_s = ts.strftime("%Y-%m-%d %H:%M") if pd.notna(ts) else "?"
-                with st.expander(f"{ts_s} — decided {rec} {pct_s}"):
+                judgment = (row.get("self_reflection_judgment") or "").strip()
+                judgment_label = judgment.split(":", 1)[0].strip() if judgment else ""
+                title = f"{ts_s} — decided {rec} {pct_s}"
+                if judgment_label in badge_color:
+                    title += f" · :{badge_color[judgment_label]}[{judgment_label}]"
+                with st.expander(title):
+                    if judgment:
+                        st.caption(f"Judgment on the previous trade: {judgment}")
                     st.write(row["self_reflection"])

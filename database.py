@@ -173,6 +173,16 @@ class TradingDatabase:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # Structured PROFIT/LOSS/BREAKEVEN verdict on the most recent trade, computed directly
+        # from (execution price vs. current price), not left to the LLM to narrate loosely.
+        # The self_reflection text is then written to explain this given judgment, not to
+        # re-derive its own. Kept as its own column (not folded into self_reflection) so it
+        # stays a short, queryable fact rather than buried in prose.
+        try:
+            cursor.execute("ALTER TABLE analysis_results ADD COLUMN self_reflection_judgment TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         # Create indexes for better query performance
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_market_data_timestamp ON market_data(timestamp)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_analysis_timestamp ON analysis_results(timestamp)")
@@ -589,22 +599,26 @@ class TradingDatabase:
         """, (limit,))
         return cursor.fetchall()
     
-    def save_self_reflection(self, analysis_id: int, reflection_text: str) -> bool:
+    def save_self_reflection(self, analysis_id: int, reflection_text: str, judgment: Optional[str] = None) -> bool:
         """
-        Attach a recursive self-reflection journal entry to an analysis_results row.
+        Attach a recursive self-reflection journal entry (and its computed PROFIT/LOSS/
+        BREAKEVEN judgment) to an analysis_results row.
 
         Args:
             analysis_id: ID of the analysis_results record for this cycle
-            reflection_text: AI-written diary entry summarizing recent performance,
-                              current market conditions, and what should change next time
+            reflection_text: AI-written diary entry explaining the judgment and setting
+                              today's plan
+            judgment: Short computed verdict on the most recent trade, e.g.
+                      "LOSS: SELL 25% @ $0.076740 -> $0.077060 (+0.42%)" - computed from real
+                      price data, not left to the model to narrate
 
         Returns:
             True if the update was successful, False otherwise
         """
         cursor = self.conn.cursor()
         cursor.execute(
-            "UPDATE analysis_results SET self_reflection = ? WHERE id = ?",
-            (reflection_text, analysis_id),
+            "UPDATE analysis_results SET self_reflection = ?, self_reflection_judgment = ? WHERE id = ?",
+            (reflection_text, judgment, analysis_id),
         )
         if cursor.rowcount > 0:
             self.conn.commit()
@@ -624,11 +638,12 @@ class TradingDatabase:
             limit: Maximum number of entries to return
 
         Returns:
-            List of rows with id, timestamp, recommendation, percentage, self_reflection
+            List of rows with id, timestamp, recommendation, percentage, self_reflection,
+            self_reflection_judgment
         """
         cursor = self.conn.cursor()
         cursor.execute("""
-            SELECT id, timestamp, recommendation, percentage, self_reflection
+            SELECT id, timestamp, recommendation, percentage, self_reflection, self_reflection_judgment
             FROM analysis_results
             WHERE self_reflection IS NOT NULL AND self_reflection != ''
             ORDER BY timestamp DESC
