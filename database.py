@@ -548,8 +548,11 @@ class TradingDatabase:
         """
         Get successful trades that still need a real decision_quality_label - either never
         graded (NULL) or stuck on the 'unknown' placeholder saved when the 24h evaluation
-        window hadn't elapsed yet at save time. Oldest first, so the backlog drains in order
-        and the oldest (most likely to now be gradable) trades are retried first.
+        window hadn't elapsed yet at save time. Newest first: the most recent eligible trades
+        feed the journal's "last N days" performance stats and the trade-learning context the
+        live decision prompt reads, so they matter most and must not get stuck behind a large
+        backlog of old history draining in the other direction. Any limit left over after
+        today's recent trades still chips away at the older backlog each cycle.
 
         Args:
             limit: Maximum number of trades to return
@@ -562,7 +565,7 @@ class TradingDatabase:
             SELECT * FROM trade_executions
             WHERE success = 1
               AND (decision_quality_label IS NULL OR decision_quality_label = 'unknown')
-            ORDER BY timestamp ASC
+            ORDER BY timestamp DESC
             LIMIT ?
         """, (limit,))
         return cursor.fetchall()
