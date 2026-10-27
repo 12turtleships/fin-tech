@@ -1,0 +1,66 @@
+# Grade past trades (real execution price vs. real price now) without running a new
+# trading cycle. This workflow has NO Coinbase credentials at all - it cannot place a
+# trade even in principle, only call mvp.py --backfill-reflections, which reads real
+# historical prices from Coinbase's public (unauthenticated) candles endpoint and writes
+# decision_correct/decision_quality_label/decision_quality_score/reflection columns on
+# trade_executions that already exist. Safe to trigger manually any time there's a backlog.
+#
+# Required repo secrets: OPENAI_API_KEY (only because DogecoinAnalyzer() requires one to
+# construct - this workflow never actually calls OpenAI).
+
+name: Backfill trade reflections
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Max trades to (re)grade this run"
+        required: false
+        default: "300"
+
+concurrency:
+  group: doge-mvp-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Same mutable-cache scheme as mvp-scheduled.yml so this operates on the same
+      # persistent DB, and the next scheduled trading run picks up these grades.
+      - name: Cache trading_data.db
+        uses: actions/cache@v4
+        with:
+          path: trading_data.db
+          key: doge-sqlite-${{ github.run_id }}
+          restore-keys: |
+            doge-sqlite-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Backfill trade grading (no market fetch, no LLM call, no trade execution)
+        run: python mvp.py --backfill-reflections "${{ inputs.limit }}"
+
+      - name: Upload trading_data.db artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trading_data_db
+          path: trading_data.db
+          if-no-files-found: ignore

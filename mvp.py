@@ -5571,6 +5571,13 @@ def main():
                 analyzer.analyze_trading_performance(days=days)
             elif sys.argv[1] == '--review-reflections':
                 analyzer.review_trade_reflections()
+            elif sys.argv[1] == '--backfill-reflections':
+                # Pure grading backfill: no market data fetch, no LLM call, no trade
+                # execution - only reads real historical prices (Coinbase's public candles
+                # endpoint, no auth) to grade past trades already on the books. Safe to run
+                # on its own; see .github/workflows/backfill-reflections.yml.
+                limit = int(sys.argv[2]) if len(sys.argv) > 2 else 300
+                analyzer.backfill_pending_trade_reflections(limit=limit)
             elif sys.argv[1] == '--generate-dataset':
                 days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
                 output_format = sys.argv[3] if len(sys.argv) > 3 else 'sqlite'
