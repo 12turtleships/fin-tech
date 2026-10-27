@@ -2972,7 +2972,13 @@ INDUSTRIAL CIRCUIT BREAKERS (enforced by code — you CANNOT override these):
         if not pending:
             return
         print(f"🔁 Retrying quality grade for {len(pending)} pending trade(s)...")
-        for trade in pending:
+        for i, trade in enumerate(pending):
+            if i > 0:
+                # Each grade needs up to 2 Coinbase public-candles calls; back-to-back with no
+                # delay hit that API's rate limit hard (measured: 84/230 fetches failed when
+                # fired with no gap, each failure silently leaving a trade un-graded for the
+                # next retry).
+                time.sleep(0.3)
             self.prompt_trade_reflection(
                 trade_id=trade["id"],
                 action=trade["action"],
