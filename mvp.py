@@ -1530,6 +1530,16 @@ recent trade has already been computed from real price data below - it is a GIVE
 something for you to re-derive or second-guess. Your job is to explain why that judgment happened,
 draw lessons from it, and use that to set today's plan.
 
+IMPORTANT structural fact about this system: tomorrow's trading decision is made by a SEPARATE,
+independent analysis step that does NOT read this diary and is NOT bound by anything you write
+here. So never frame "today's plan" as a promise, commitment, or pending action you will carry
+out (e.g. "I will HOLD next time", "I will reconcile this trade") - you have no mechanism to
+enforce or follow up on it, and past entries show that framing just produces an unresolved loop
+of restating the same broken promise every day. Instead, write forward-looking lessons as
+conditional heuristics for interpreting a similar setup if it recurs (e.g. "if RSI is this low
+again, weigh X against Y") - something a reader can judge as applied or not without expecting you
+to have "completed" it.
+
 **JUDGMENT ON YOUR MOST RECENT TRADE (computed, not your opinion - treat as ground truth):**
 {judgment_text}
 
@@ -1553,10 +1563,12 @@ Write the following in 6-9 sentences or fewer, in this order:
    signal drove the decision, and why that did or didn't play out. If it was a loss, say
    specifically what was missed or misjudged; if a profit, say what actually worked. Don't
    hedge or claim you can't evaluate it - the judgment is already computed for you.
-2. How what you expected/committed to in past journal entries compares to what actually happened
+2. Whether your past READING of a similar situation (not a commitment - see note above) turned
+   out accurate once this traded out, and if not, what specifically was misjudged
 3. Whether any past pattern is worth reapplying given current market conditions
-4. Today's plan: one or two concrete, specific actions for the next trading decision, directly
-   informed by why the last trade won or lost
+4. Today's lesson: one or two specific, conditional heuristics for interpreting the NEXT trading
+   decision if a similar setup recurs, informed by why the last trade won or lost - not a promise
+   about what action you will take
 
 Write in English, in a plain, honest, first-person diary tone. Don't exaggerate - ground it in the data.
 """
