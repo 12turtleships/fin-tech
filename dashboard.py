@@ -424,10 +424,13 @@ with tab_journal:
                 pct_s = f"{pct:.0f}%" if pd.notna(pct) else "—"
                 ts_s = ts.strftime("%Y-%m-%d %H:%M") if pd.notna(ts) else "?"
                 judgment = (row.get("self_reflection_judgment") or "").strip()
-                judgment_label = judgment.split(":", 1)[0].strip() if judgment else ""
+                judgment_label, _, judgment_rest = judgment.partition(":")
+                judgment_label = judgment_label.strip()
+                judgment_action = judgment_rest.strip().split(" ", 1)[0] if judgment_rest.strip() else ""
                 title = f"{ts_s} — decided {rec} {pct_s}"
                 if judgment_label in badge_color:
-                    title += f" · :{badge_color[judgment_label]}[{judgment_label}]"
+                    action_s = f" ({judgment_action})" if judgment_action else ""
+                    title += f" · Last trade{action_s}: :{badge_color[judgment_label]}[{judgment_label}]"
                 with st.expander(title):
                     if judgment:
                         st.caption(f"Judgment on the previous trade: {judgment}")
